@@ -228,7 +228,7 @@ def _format_alert(event, score, exchanges):
     return (
         "🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING\n"
         f"Токен: {event['ticker'] or 'тикер уточняется'}\n"
-        f"Биржа: {event['exchange']} | SPOT\n"
+        f"Биржа: {event['exchange']} | {event.get('market_type', 'SPOT')}\n"
         f"Дата и время: {kyiv:%d.%m.%Y %H:%M} Киев\n"
         f"Время UTC: {utc:%d.%m.%Y %H:%M}\n"
         f"Другие подтверждения: {other}\n"
