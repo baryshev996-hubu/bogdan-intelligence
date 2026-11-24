@@ -65,18 +65,20 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
 def is_allowed_telegram_alert(message):
-    """Only deliver actionable LONG/SHORT signals and large BUY/SELL executions."""
-    normalized = message.strip().upper()
-    signal = (
-        "BOGDAN INTELLIGENCE | LONG" in normalized
-        or "BOGDAN INTELLIGENCE | SHORT" in normalized
-    )
-    large_execution = (
-        "LARGE EXECUTION | HYPERLIQUID |" in normalized
-        and any(line.strip().startswith(("TAKER: BUY", "TAKER: SELL")) for line in normalized.splitlines())
-    )
-    order_flow = "ORDER FLOW INTELLIGENCE |" in normalized
-    return signal or large_execution or order_flow
+    """Fail-closed Telegram allowlist. Price/news/derivatives chatter is never delivered."""
+    lines = [line.strip().upper() for line in str(message).splitlines() if line.strip()]
+    if not lines:
+        return False
+    if any("CRYPTO MOVE" in line or "BINANCE SPOT TICKER STREAM" in line for line in lines):
+        return False
+    header = lines[0]
+    if header in {"BOGDAN INTELLIGENCE | LONG", "BOGDAN INTELLIGENCE | SHORT"}:
+        return True
+    if header.startswith("LARGE EXECUTION | HYPERLIQUID |"):
+        return any(line.startswith(("TAKER: BUY", "TAKER: SELL")) for line in lines[1:])
+    if header.startswith("ORDER FLOW INTELLIGENCE |"):
+        return True
+    return False
 
 
 async def telegram_send(session, text):
