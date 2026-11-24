@@ -63,14 +63,14 @@ class PaperBook:
 
     def _save_data(self, data=None):
         data = self.state if data is None else data
-        os.makedirs(os.path.dirname(PATH) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix="paper-", dir=os.path.dirname(self.path) or ".")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, PATH)
+            os.replace(tmp, self.path)
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
@@ -82,7 +82,7 @@ class PaperBook:
         symbol = signal["symbol"]
         if not self.active():
             return False
-        if symbol in self.state["open_trades"] or len(self.state["open_trades"]) >= MAX_OPEN:
+        if symbol in self.state["open_trades"] or len(self.state["open_trades"]) >= self.max_open:
             return False
         equity = float(self.state["balance"])
         if equity <= 0:
