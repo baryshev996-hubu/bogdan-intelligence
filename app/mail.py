@@ -67,6 +67,32 @@ SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600")))
 last_signal_sent = {}
 telegram_send_lock = asyncio.Lock()
 telegram_last_sent = 0.0
+telegram_auth_valid = None
+
+
+async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
+    """Validate the configured bot token once at startup without exposing it."""
+    global telegram_auth_valid
+    if not BOT_TOKEN:
+        telegram_auth_valid = False
+        log.error("TELEGRAM AUTH CHECK FAILED | TELEGRAM_BOT_TOKEN is empty")
+        return False
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+    try:
+        async with session.get(url, timeout=15) as response:
+            body = await response.json(content_type=None)
+            telegram_auth_valid = response.status == 200 and body.get("ok") is True
+            if telegram_auth_valid:
+                bot = body.get("result") or {}
+                log.info("TELEGRAM AUTH OK | bot_username=@%s", bot.get("username", "unknown"))
+            else:
+                log.error("TELEGRAM AUTH CHECK FAILED | HTTP %s | %s",
+                          response.status, body.get("description", "unknown Telegram API error"))
+            return telegram_auth_valid
+    except Exception as exc:
+        telegram_auth_valid = None
+        log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s", type(exc).__name__, str(exc)[:180])
+        return False
 
 
 def is_allowed_telegram_alert(message: str) -> bool:
@@ -111,6 +137,9 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
 
     if not BOT_TOKEN or not CHAT_ID:
         log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+        return False
+    if telegram_auth_valid is False:
+        log.error("TELEGRAM BLOCKED | startup token validation failed; update TELEGRAM_BOT_TOKEN in Railway")
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -405,6 +434,7 @@ async def main():
     log.info("PAPER SPRINT | %s", paper_sprint_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        await validate_telegram_auth(session)
         universe = await discover_trading_universe(session)
         tasks = [binance_signal_monitor(session, universe)]
 
