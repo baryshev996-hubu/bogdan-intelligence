@@ -63,8 +63,25 @@ def utc_now():
 def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
+def is_allowed_telegram_alert(message):
+    """Only deliver actionable LONG/SHORT signals and large BUY/SELL executions."""
+    normalized = message.strip().upper()
+    signal = (
+        "BOGDAN INTELLIGENCE | LONG" in normalized
+        or "BOGDAN INTELLIGENCE | SHORT" in normalized
+    )
+    large_execution = (
+        "LARGE EXECUTION | HYPERLIQUID |" in normalized
+        and ("\\nTAKER: BUY\\n" in normalized or "\\nTAKER: SELL\\n" in normalized)
+    )
+    return signal or large_execution
+
+
 async def telegram_send(session, text):
     global telegram_last_sent
+    if not is_allowed_telegram_alert(text):
+        log.info("Telegram alert suppressed by strict BUY/SELL/LONG/SHORT filter")
+        return False
     if not BOT_TOKEN or not CHAT_ID:
         log.warning("Telegram not configured. Alert was not sent:\n%s", text)
         return False
@@ -405,14 +422,12 @@ async def main():
         tasks = [binance_monitor(session)]
         if ENABLE_MARKET_INTEL:
             tasks.append(run_market_intelligence(session, symbols))
-        if ENABLE_SEC_ALERTS:
-            tasks.append(sec_monitor(session))
-        if ENABLE_RSS_ALERTS and RSS_FEEDS:
-            tasks.append(rss_monitor(session))
-        log.info("Starting signal engine. Signal delivery=%s for %s; SEC alerts=%s, RSS alerts=%s",
-                 ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS), ENABLE_SEC_ALERTS,
-                 ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
-        log.info("Public market intelligence enabled=%s", ENABLE_MARKET_INTEL)
+        log.info(
+            "Starting strict Telegram delivery: LONG/SHORT signals and large BUY/SELL executions only. "
+            "Price-only, funding, OI, SEC and RSS alerts are disabled."
+        )
+        log.info("Signal delivery=%s for %s; public trade tape=%s",
+                 ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS), ENABLE_MARKET_INTEL)
         await asyncio.gather(*tasks)
 
 
