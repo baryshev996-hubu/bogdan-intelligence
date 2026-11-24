@@ -172,6 +172,8 @@ def evaluate(symbol, candles_by_interval):
     confidence += 5 if 52 <= rsi5 <= 63 and side == "LONG" else 0
     confidence += 5 if 37 <= rsi5 <= 48 and side == "SHORT" else 0
     confidence = min(confidence, 90)
+    if confidence < 75:
+        return None
 
     close_time = last.get("close_time")
     if close_time:
