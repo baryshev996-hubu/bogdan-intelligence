@@ -223,7 +223,9 @@ async def discover_trading_universe(session):
             and row.get("contractType") == "PERPETUAL"
             and row.get("quoteAsset") == "USDT"
             and row.get("symbol", "").endswith("USDT")
-            and not any(token in row.get("symbol", "") for token in ("USDC", "BUSD", "TUSD", "FDUSD"))
+            # Match quote-asset suffixes only. Substring checks wrongly reject
+            # BNBUSDT, APTUSDT, ARBUSDT, DOTUSDT and 1000SHIBUSDT.
+            and not row.get("symbol", "").endswith(("USDC", "BUSD", "TUSD", "FDUSD"))
         }
 
         valid_pinned = pinned & eligible
