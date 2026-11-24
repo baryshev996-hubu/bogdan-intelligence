@@ -28,7 +28,7 @@ async def send(session, message):
     from app.mail import telegram_send
     await telegram_send(session, message)
 
-async def derivatives_monitor(session):
+async def derivatives_monitor(session, symbols=None):
     gate = Gate()
     history = defaultdict(lambda: deque(maxlen=7))
     base = "https://fapi.binance.com"
@@ -76,9 +76,9 @@ async def hyperliquid_whale_monitor(session):
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=60, close_timeout=10, open_timeout=20) as ws:
-                for coin in COINS:
+                for coin in watch_coins:
                     await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
-                log.info("Hyperliquid public trade tape connected: %s", COINS)
+                log.info("Hyperliquid public trade tape connected: %s", watch_coins)
                 async for raw in ws:
                     packet = json.loads(raw)
                     if packet.get("channel") != "trades":
