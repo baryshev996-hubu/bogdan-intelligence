@@ -119,10 +119,6 @@ async def hyperliquid_whale_monitor(session, coins=None):
             await asyncio.sleep(10)
 
 async def run_market_intelligence(session, symbols=None):
-    selected = [s.upper() for s in symbols] if symbols else SYMBOLS
-    # Hyperliquid's public trade channel uses its own coin universe.
-    # Keep the verified major-coin list separate from Binance-discovered contracts.
-    await asyncio.gather(
-        derivatives_monitor(session, selected),
-        hyperliquid_whale_monitor(session, COINS),
-    )
+    # Deliver only large public BUY/SELL executions. OI and funding alerts are
+    # intentionally not started because they are context, not trade signals.
+    await hyperliquid_whale_monitor(session, COINS)
