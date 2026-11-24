@@ -19,7 +19,7 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
     "BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt"
 ).split(",") if s.strip()]
 LIMIT = 1500
-LOOKBACK_DAYS = 14
+LOOKBACK_DAYS = 45
 INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 HORIZON_BARS = 144  # 12 hours of 5m candles
 SAME_SIDE_COOLDOWN_MS = 6 * 60 * 60 * 1000
