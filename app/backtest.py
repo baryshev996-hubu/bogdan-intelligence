@@ -30,7 +30,10 @@ async def fetch_candles(session, symbol, interval):
         rows = await response.json(content_type=None)
 
     candles = []
+    now_ms = int(__import__("time").time() * 1000)
     for row in rows:
+        if int(row[6]) >= now_ms:
+            continue
         candles.append({
             "open_time": int(row[0]),
             "open": float(row[1]),
@@ -172,7 +175,7 @@ def backtest_symbol(symbol, data):
             "time": as_of,
         })
         last_signal = {"side": signal["side"], "time": as_of}
-        index += max(1, exit_offset + 1)
+        index += exit_offset + 2
 
     return results
 
@@ -195,6 +198,8 @@ def report(all_results):
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)
 
+    log.info("BACKTEST COSTS | taker_fee_each_side=%.3f%% slippage_each_side=%.3f%%; funding excluded",
+             TAKER_FEE_RATE * 100, SLIPPAGE_RATE * 100)
     log.info(
         "BACKTEST | trades=%s wins=%s losses=%s win_rate=%.1f%% "
         "avg_net_R=%.3f total_net_R=%.2f profit_factor=%.2f max_drawdown_R=%.2f",
