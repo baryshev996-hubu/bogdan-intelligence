@@ -42,6 +42,12 @@ SIGNAL_DELIVERY_SYMBOLS = {x.strip().upper() for x in os.getenv(
     "SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT"
 ).split(",") if x.strip()}
 
+AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
+MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "12"))))
+INTEL_POLL_SECONDS = max(60, int(os.getenv("INTEL_POLL_SECONDS", "180")))
+INTEL_MIN_ALERT_SCORE = max(2, min(3, int(os.getenv("INTEL_MIN_ALERT_SCORE", "3"))))
+intel_last_alert = {}
+
 seen = set()
 last_prices = {}
 last_sec_check = {}
@@ -241,12 +247,99 @@ def store_closed_candle(history, candle):
         history.append(candle)
 
 
+async def discover_trading_universe(session):
+    """Keep configured majors and add liquid USDT perpetuals."""
+    pinned = {s.upper() for s in BINANCE_SYMBOLS}
+    if not AUTO_DISCOVER_ALTS or MAX_DISCOVERED_ALTS == 0:
+        return sorted(pinned)
+    try:
+        async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20) as resp:
+            resp.raise_for_status()
+            exchange = await resp.json(content_type=None)
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=20) as resp:
+            resp.raise_for_status()
+            tickers = await resp.json(content_type=None)
+        eligible = {row["symbol"] for row in exchange.get("symbols", [])
+                    if row.get("status") == "TRADING" and row.get("contractType") == "PERPETUAL"
+                    and row.get("quoteAsset") == "USDT" and row.get("symbol", "").endswith("USDT")
+                    and not any(x in row.get("symbol", "") for x in ("USDC", "BUSD", "TUSD", "FDUSD"))}
+        ranked = []
+        for row in tickers:
+            if row.get("symbol") in eligible and row["symbol"] not in pinned:
+                try:
+                    ranked.append((float(row.get("quoteVolume", 0)), row["symbol"]))
+                except (TypeError, ValueError):
+                    pass
+        additions = [s for _, s in sorted(ranked, reverse=True)[:MAX_DISCOVERED_ALTS]]
+        log.info("Trading universe: %s configured + %s liquid discovered alts", len(pinned), len(additions))
+        return sorted(pinned | set(additions))
+    except Exception:
+        log.exception("Altcoin discovery failed; using configured symbols only")
+        return sorted(pinned)
+
+
+async def market_intel_monitor(session, symbols):
+    """Public derivatives positioning alerts. These are context, never trade triggers."""
+    while True:
+        for symbol in symbols:
+            try:
+                paths = [
+                    ("/fapi/v1/openInterest", {"symbol": symbol}),
+                    ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}),
+                    ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1}),
+                    ("/futures/data/takerlongshortRatio", {"symbol": symbol, "period": "5m", "limit": 1}),
+                ]
+                async def get(path, params):
+                    async with session.get("https://fapi.binance.com" + path, params=params, timeout=15) as resp:
+                        resp.raise_for_status()
+                        return await resp.json(content_type=None)
+                data = await asyncio.gather(*(get(path, params) for path, params in paths),
+                                            return_exceptions=True)
+                oi, funding, crowd, taker = data
+                funding = funding[0] if isinstance(funding, list) and funding else None
+                crowd = crowd[0] if isinstance(crowd, list) and crowd else None
+                taker = taker[0] if isinstance(taker, list) and taker else None
+                notes, score = [], 0
+                if funding:
+                    rate = float(funding.get("fundingRate", 0))
+                    if abs(rate) >= 0.0008:
+                        score += 1
+                        notes.append(f"Funding {rate * 100:.3f}%")
+                if crowd:
+                    ratio = float(crowd.get("longShortRatio", 1))
+                    if ratio >= 2.0 or ratio <= 0.5:
+                        score += 1
+                        notes.append(f"Global Long/Short {ratio:.2f}")
+                if taker:
+                    ratio = float(taker.get("buySellRatio", 1))
+                    if ratio >= 1.8 or ratio <= 0.56:
+                        score += 1
+                        notes.append(f"Taker buy/sell {ratio:.2f}")
+                if score < INTEL_MIN_ALERT_SCORE:
+                    continue
+                key = (symbol, "|".join(notes))
+                now = time.time()
+                if now - intel_last_alert.get(key, 0) < 3600:
+                    continue
+                oi_value = oi.get("openInterest", "n/a") if isinstance(oi, dict) else "n/a"
+                msg = (f"⚠️ BOGDAN INTELLIGENCE | DERIVATIVES INTEL\\n{symbol}\\n"
+                       + "\\n".join(f"• {note}" for note in notes)
+                       + f"\\nOpen Interest: {oi_value}"
+                       + "\\nПерекос позиционирования. Это предупреждение, не LONG/SHORT сигнал.")
+                if await telegram_send(session, msg):
+                    intel_last_alert[key] = now
+            except Exception:
+                log.exception("Derivatives intelligence error for %s", symbol)
+            await asyncio.sleep(0.15)
+        await asyncio.sleep(INTEL_POLL_SECONDS)
+
+
 async def binance_monitor(session):
     if not BINANCE_SYMBOLS:
         log.warning("No BINANCE_SYMBOLS configured; signal engine is idle.")
         return
 
-    symbols = [s.upper() for s in BINANCE_SYMBOLS]
+    symbols = await discover_trading_universe(session)
     histories = {
         symbol: {tf: deque(maxlen=MAX_CANDLES) for tf in INTERVALS}
         for symbol in symbols
@@ -364,7 +457,10 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=30)
     connector = aiohttp.TCPConnector(limit=30)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        symbols = await discover_trading_universe(session) if BINANCE_SYMBOLS else []
         tasks = [binance_monitor(session)]
+        if os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true" and symbols:
+            tasks.append(market_intel_monitor(session, symbols))
         if ENABLE_MARKET_INTEL:
             tasks.append(run_market_intelligence(session))
         if ENABLE_SEC_ALERTS:
