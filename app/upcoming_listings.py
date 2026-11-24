@@ -79,6 +79,9 @@ def _extract_ticker(title):
     if match:
         return match.group(1)
     match = re.search(r"\b([A-Z0-9]{2,12})/USDT\b", str(title), re.I)
+    if match:
+        return match.group(1).upper()
+    match = re.search(r"\b([A-Z0-9]{2,12})USDT\b", str(title), re.I)
     return match.group(1).upper() if match else None
 
 
