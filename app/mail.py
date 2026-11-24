@@ -35,6 +35,7 @@ ENABLE_SEC_ALERTS = os.getenv("ENABLE_SEC_ALERTS", "false").lower() == "true"
 ENABLE_RSS_ALERTS = os.getenv("ENABLE_RSS_ALERTS", "false").lower() == "true"
 SIGNAL_SAME_SIDE_COOLDOWN = int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600"))
 SIGNAL_FLIP_COOLDOWN = int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600"))
+ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "false").lower() == "true"
 
 seen = set()
 last_prices = {}
@@ -55,7 +56,7 @@ async def telegram_send(session, text):
     global telegram_last_sent
     if not BOT_TOKEN or not CHAT_ID:
         log.warning("Telegram not configured. Alert was not sent:\n%s", text)
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
@@ -73,7 +74,7 @@ async def telegram_send(session, text):
                     body = await resp.json(content_type=None)
 
                     if resp.status == 200 and body.get("ok"):
-                        return
+                        return True
 
                     if resp.status == 429:
                         retry_after = body.get("parameters", {}).get("retry_after", 2)
@@ -93,18 +94,18 @@ async def telegram_send(session, text):
                         continue
 
                     log.error("Telegram API error (HTTP %s): %s", resp.status, body)
-                    return
+                    return False
 
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 if attempt == 3:
                     log.exception("Telegram delivery failed after retries")
-                    return
+                    return False
                 delay = min(2 ** attempt, 15)
                 log.warning("Telegram network error; retrying in %s seconds", delay, exc_info=True)
                 await asyncio.sleep(delay)
             except Exception:
                 log.exception("Unexpected Telegram delivery error")
-                return
+                return False
 
 async def load_ticker_map(session):
     url = "https://www.sec.gov/files/company_tickers.json"
@@ -311,14 +312,26 @@ async def binance_monitor(session):
                         if now - previous["sent_at"] < cooldown:
                             continue
 
-                    await telegram_send(session, format_signal(signal))
-                    last_signal_sent[symbol] = {
-                        "side": signal["side"],
-                        "sent_at": now,
-                        "candle_id": signal["candle_id"],
-                    }
-                    log.info("Delivered %s signal for %s, confidence=%s",
-                             signal["side"], symbol, signal["confidence"])
+                    if not ENABLE_SIGNAL_DELIVERY:
+                        log.info("SHADOW SIGNAL %s %s confidence=%s; Telegram delivery disabled",
+                                 signal["side"], symbol, signal["confidence"])
+                        last_signal_sent[symbol] = {
+                            "side": signal["side"], "sent_at": now,
+                            "candle_id": signal["candle_id"],
+                        }
+                        continue
+
+                    sent = await telegram_send(session, format_signal(signal))
+                    if sent:
+                        last_signal_sent[symbol] = {
+                            "side": signal["side"], "sent_at": now,
+                            "candle_id": signal["candle_id"],
+                        }
+                        log.info("Delivered %s signal for %s, confidence=%s",
+                                 signal["side"], symbol, signal["confidence"])
+                    else:
+                        log.warning("Signal %s %s was not delivered; it remains eligible for retry",
+                                    signal["side"], symbol)
 
         except Exception as exc:
             log.exception("Binance signal feed disconnected (%s); retrying in 15 sec",
@@ -342,8 +355,8 @@ async def main():
             tasks.append(sec_monitor(session))
         if ENABLE_RSS_ALERTS and RSS_FEEDS:
             tasks.append(rss_monitor(session))
-        log.info("Starting signal engine. SEC alerts=%s, RSS alerts=%s",
-                 ENABLE_SEC_ALERTS, ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
+        log.info("Starting signal engine. Signal delivery=%s, SEC alerts=%s, RSS alerts=%s",
+                 ENABLE_SIGNAL_DELIVERY, ENABLE_SEC_ALERTS, ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
         await asyncio.gather(*tasks)
 
 
