@@ -1,4 +1,7 @@
-"""Run deterministic tests and a historical dry-run before deployment."""
+"""Run deterministic tests and a historical dry-run before deployment.
+
+A failed unit test blocks the release; backtest output is retained in deploy logs.
+"""
 import asyncio
 import logging
 import sys
