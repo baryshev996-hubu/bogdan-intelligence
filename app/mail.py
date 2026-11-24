@@ -15,6 +15,7 @@ import websockets
 from dotenv import load_dotenv
 
 from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
+from app.market_intel import run_market_intelligence
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -36,6 +37,7 @@ ENABLE_RSS_ALERTS = os.getenv("ENABLE_RSS_ALERTS", "false").lower() == "true"
 SIGNAL_SAME_SIDE_COOLDOWN = int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600"))
 SIGNAL_FLIP_COOLDOWN = int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600"))
 ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
+ENABLE_MARKET_INTEL = os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true"
 SIGNAL_DELIVERY_SYMBOLS = {x.strip().upper() for x in os.getenv(
     "SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT"
 ).split(",") if x.strip()}
@@ -363,6 +365,8 @@ async def main():
     connector = aiohttp.TCPConnector(limit=30)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         tasks = [binance_monitor(session)]
+        if ENABLE_MARKET_INTEL:
+            tasks.append(run_market_intelligence(session))
         if ENABLE_SEC_ALERTS:
             tasks.append(sec_monitor(session))
         if ENABLE_RSS_ALERTS and RSS_FEEDS:
@@ -370,6 +374,7 @@ async def main():
         log.info("Starting signal engine. Signal delivery=%s for %s; SEC alerts=%s, RSS alerts=%s",
                  ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS), ENABLE_SEC_ALERTS,
                  ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
+        log.info("Public market intelligence enabled=%s", ENABLE_MARKET_INTEL)
         await asyncio.gather(*tasks)
 
 
