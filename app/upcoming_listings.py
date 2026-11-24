@@ -174,26 +174,33 @@ async def _bybit_listings(session):
 
 
 async def _okx_listings(session):
-    data = await _json_get(session, "https://www.okx.com/api/v5/public/instruments", {"instType": "SPOT"})
     out = []
     now_ms = int(time.time() * 1000)
-    for item in data.get("data") or []:
-        try:
-            list_ms = int(item.get("listTime") or 0)
-        except (TypeError, ValueError):
-            continue
-        if list_ms <= now_ms or not item.get("instId", "").endswith("-USDT"):
-            continue
-        when = datetime.fromtimestamp(list_ms / 1000, tz=timezone.utc)
-        inst = item.get("instId", "")
-        base = item.get("baseCcy") or inst.split("-")[0]
-        out.append({
-            "id": "okx:" + inst + ":" + str(list_ms),
-            "exchange": "OKX", "title": "OKX scheduled SPOT listing " + inst,
-            "ticker": base, "when": when,
-            "url": "https://www.okx.com/help/section/announcements-new-listings",
-            "source": "OKX public instruments API (listTime)",
-        })
+    for inst_type, market_type in (("SPOT", "SPOT"), ("SWAP", "FUTURES"), ("FUTURES", "FUTURES")):
+        data = await _json_get(
+            session, "https://www.okx.com/api/v5/public/instruments", {"instType": inst_type}
+        )
+        for item in data.get("data") or []:
+            try:
+                list_ms = int(item.get("listTime") or 0)
+            except (TypeError, ValueError):
+                continue
+            if list_ms <= now_ms:
+                continue
+            inst = item.get("instId", "")
+            if market_type == "SPOT" and not inst.endswith("-USDT"):
+                continue
+            if market_type == "FUTURES" and not (inst.endswith("-USDT-SWAP") or inst.endswith("-USDT")):
+                continue
+            base = item.get("baseCcy") or inst.split("-")[0]
+            when = datetime.fromtimestamp(list_ms / 1000, tz=timezone.utc)
+            out.append({
+                "id": "okx:" + inst_type + ":" + inst + ":" + str(list_ms),
+                "exchange": "OKX", "title": f"OKX scheduled {market_type} listing {inst}",
+                "market_type": market_type, "ticker": base, "when": when,
+                "url": "https://www.okx.com/help/section/announcements-new-listings",
+                "source": f"OKX public instruments API ({inst_type} listTime)",
+            })
     return out
 
 
@@ -239,7 +246,7 @@ async def run_upcoming_listings_monitor(session):
         log.info("UPCOMING LISTINGS disabled by ENABLE_UPCOMING_LISTINGS=false")
         return
     seen = _load_seen()
-    log.info("UPCOMING LISTINGS enabled | sources=Binance,Bybit,OKX | lookahead=%sh | min_event_score=%s",
+    log.info("UPCOMING LISTINGS enabled | sources=Binance,Bybit,OKX | markets=SPOT,FUTURES | lookahead=%sh | min_event_score=%s",
              LOOKAHEAD_HOURS, MIN_EVENT_SCORE)
     while True:
         gathered = []
@@ -263,13 +270,13 @@ async def run_upcoming_listings_monitor(session):
                 continue
             if not now.timestamp() < event["when"].timestamp() <= horizon:
                 continue
-            by_ticker.setdefault(event["ticker"], set()).add(event["exchange"])
+            by_ticker.setdefault((event["ticker"], event.get("market_type", "SPOT")), set()).add(event["exchange"])
 
         candidates = []
         for event in gathered:
             if not event["ticker"] or not now.timestamp() < event["when"].timestamp() <= horizon:
                 continue
-            exchanges = by_ticker.get(event["ticker"], {event["exchange"]})
+            exchanges = by_ticker.get((event["ticker"], event.get("market_type", "SPOT")), {event["exchange"]})
             score = _event_score(event, len(exchanges))
             if score >= MIN_EVENT_SCORE and event["id"] not in seen:
                 candidates.append((event, score, exchanges))
