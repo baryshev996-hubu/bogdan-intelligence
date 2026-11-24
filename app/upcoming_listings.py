@@ -25,10 +25,11 @@ KYIV = ZoneInfo("Europe/Kyiv")
 
 EXCLUDED = (
     "tokenized stock", "tokenised stock", "pre-ipo", "tradfi", "stock token",
-    "leveraged token", "etf", "delist", "perpetual contract", "futures contract",
-    "margin trading", "earn", "convert", "launchpool", "launchpool subscription",
+    "leveraged token", " etf", "delist", "margin trading", "earn", "convert",
+    "launchpool", "launchpool subscription", "equity", "equities", "stock",
 )
-LISTING_WORDS = ("will list", "new listing", "spot trading", "spot listing", "listing of")
+
+LISTING_WORDS = ("will list", "new listing", "spot trading", "spot listing", "listing of", "perpetual", "futures", "swap")
 
 
 def _clean(value):
@@ -37,11 +38,15 @@ def _clean(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _is_spot_listing(title, description=""):
+def _market_type(title, description=""):
     text = (str(title) + " " + str(description)).lower()
     if any(word in text for word in EXCLUDED):
-        return False
-    return any(word in text for word in LISTING_WORDS)
+        return None
+    if any(word in text for word in ("perpetual", "futures", "future contract", "perp", "swap")):
+        return "FUTURES"
+    if any(word in text for word in ("will list", "new listing", "spot trading", "spot listing", "listing of")):
+        return "SPOT"
+    return None
 
 
 def _parse_explicit_utc(text):
@@ -111,7 +116,7 @@ async def _binance_listings(session):
     for item in articles:
         title = _clean(item.get("title"))
         code = str(item.get("code") or item.get("id") or "")
-        if not code or not _is_spot_listing(title):
+        if not code:
             continue
         detail_url = "https://www.binance.com/en/support/announcement/detail/" + code
         detail_text = ""
@@ -132,11 +137,12 @@ async def _binance_listings(session):
                         detail_text = _clean(await response.text())
             except Exception:
                 log.debug("Binance detail page fetch failed for %s", code)
+        market_type = _market_type(title, detail_text)
         when = _parse_explicit_utc(detail_text) or _parse_explicit_utc(title)
-        if when:
+        if when and market_type:
             out.append({
                 "id": "binance:" + code, "exchange": "Binance", "title": title,
-                "ticker": _extract_ticker(title), "when": when,
+                "market_type": market_type, "ticker": _extract_ticker(title + " " + detail_text), "when": when,
                 "url": detail_url, "source": "Binance official announcement",
             })
     return out
@@ -152,14 +158,15 @@ async def _bybit_listings(session):
     for item in result.get("list") or []:
         title = _clean(item.get("title"))
         description = _clean(item.get("description"))
-        if not _is_spot_listing(title, description):
+        market_type = _market_type(title, description)
+        if not market_type:
             continue
         when = _parse_explicit_utc(title + " " + description)
         if not when:
             continue
         out.append({
             "id": "bybit:" + str(item.get("url") or item.get("publishTime") or title),
-            "exchange": "Bybit", "title": title, "ticker": _extract_ticker(title),
+            "exchange": "Bybit", "title": title, "market_type": market_type, "ticker": _extract_ticker(title + " " + description),
             "when": when, "url": item.get("url") or "https://announcements.bybit.com/",
             "source": "Bybit official announcement",
         })
