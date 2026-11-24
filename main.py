@@ -40,16 +40,19 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
 def is_allowed_telegram_alert(message):
-    normalized = message.strip().upper()
-    return (
-        "BOGDAN INTELLIGENCE | LONG" in normalized
-        or "BOGDAN INTELLIGENCE | SHORT" in normalized
-        or (
-            "LARGE EXECUTION | HYPERLIQUID |" in normalized
-            and any(line.strip().startswith(("TAKER: BUY", "TAKER: SELL"))
-                    for line in normalized.splitlines())
-        )
-    )
+    lines = [line.strip().upper() for line in str(message).splitlines() if line.strip()]
+    if not lines:
+        return False
+    if any("CRYPTO MOVE" in line or "BINANCE SPOT TICKER STREAM" in line for line in lines):
+        return False
+    header = lines[0]
+    if header in {"BOGDAN INTELLIGENCE | LONG", "BOGDAN INTELLIGENCE | SHORT"}:
+        return True
+    if header.startswith("LARGE EXECUTION | HYPERLIQUID |"):
+        return any(line.startswith(("TAKER: BUY", "TAKER: SELL")) for line in lines[1:])
+    if header.startswith("ORDER FLOW INTELLIGENCE |"):
+        return True
+    return False
 
 async def telegram_send(session, text):
     # Legacy entrypoint safety net. Block all price-move, SEC and RSS alerts.
@@ -186,19 +189,8 @@ async def binance_monitor():
                         continue
                     previous = last_prices.get(symbol)
                     last_prices[symbol] = price
-                    # 24h change threshold is a broad alert, not a trade signal.
-                    if abs(change) >= PRICE_CHANGE_PCT:
-                        key = fingerprint(f"binance:{symbol}:{round(change,1)}:{int(time.time()//1800)}")
-                        if key not in seen:
-                            seen.add(key)
-                            direction = "рост" if change > 0 else "падение"
-                            await telegram_send_http(
-                                f"📊 BOGDAN INTELLIGENCE | CRYPTO MOVE\n"
-                                f"Актив: {symbol}\nЦена: {price}\n"
-                                f"Изменение за 24 часа: {change:+.2f}% ({direction})\n"
-                                f"Время: {utc_now()}\n"
-                                f"Источник: Binance Spot ticker stream\n"
-                                f"Это рыночное движение, а не подтверждённый торговый сигнал.")
+                    # Price-only ticker events are intentionally never sent to Telegram.
+
         except Exception:
             log.exception("Binance websocket disconnected; reconnecting in 5 sec")
             await asyncio.sleep(5)
