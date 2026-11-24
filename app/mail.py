@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
@@ -11,6 +12,8 @@ import aiohttp
 import feedparser
 import websockets
 from dotenv import load_dotenv
+
+from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -27,11 +30,16 @@ WATCH_TICKERS = [x.strip().upper() for x in os.getenv(
 BINANCE_SYMBOLS = [x.strip().lower() for x in os.getenv(
     "BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt").split(",") if x.strip()]
 RSS_FEEDS = [x.strip() for x in os.getenv("RSS_FEEDS", "").split(",") if x.strip()]
+ENABLE_SEC_ALERTS = os.getenv("ENABLE_SEC_ALERTS", "false").lower() == "true"
+ENABLE_RSS_ALERTS = os.getenv("ENABLE_RSS_ALERTS", "false").lower() == "true"
+SIGNAL_SAME_SIDE_COOLDOWN = int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600"))
+SIGNAL_FLIP_COOLDOWN = int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600"))
 
 seen = set()
 last_prices = {}
 last_sec_check = {}
 ticker_to_cik = {}
+last_signal_sent = {}
 
 telegram_send_lock = asyncio.Lock()
 telegram_last_sent = 0.0
@@ -193,43 +201,129 @@ async def rss_monitor(session):
                 log.exception("RSS feed error: %s", feed_url)
         await asyncio.sleep(max(POLL_SECONDS, 60))
 
-async def binance_monitor():
+async def load_binance_history(session, symbol, interval):
+    url = "https://data-api.binance.vision/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": 200}
+    async with session.get(url, params=params, timeout=20) as resp:
+        if resp.status == 451:
+            raise RuntimeError("Binance market-data REST endpoint returned HTTP 451")
+        resp.raise_for_status()
+        rows = await resp.json(content_type=None)
+
+    now_ms = int(time.time() * 1000)
+    result = []
+    for row in rows:
+        candle = {
+            "open_time": int(row[0]),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "close_time": int(row[6]),
+        }
+        if candle["close_time"] < now_ms:
+            result.append(candle)
+    return result
+
+
+def store_closed_candle(history, candle):
+    if history and history[-1]["open_time"] == candle["open_time"]:
+        history[-1] = candle
+    elif not history or history[-1]["open_time"] < candle["open_time"]:
+        history.append(candle)
+
+
+async def binance_monitor(session):
     if not BINANCE_SYMBOLS:
+        log.warning("No BINANCE_SYMBOLS configured; signal engine is idle.")
         return
-    streams = "/".join(f"{s}@ticker" for s in BINANCE_SYMBOLS)
-    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+
+    symbols = [s.upper() for s in BINANCE_SYMBOLS]
+    histories = {
+        symbol: {tf: deque(maxlen=MAX_CANDLES) for tf in INTERVALS}
+        for symbol in symbols
+    }
+
+    # Warm up indicators with closed historical candles before evaluating live setups.
+    for symbol in symbols:
+        for interval in INTERVALS:
+            try:
+                rows = await load_binance_history(session, symbol, interval)
+                histories[symbol][interval].extend(rows)
+                log.info("Loaded %s closed %s candles for %s",
+                         len(rows), interval, symbol)
+            except Exception:
+                log.exception("Could not load Binance history for %s %s",
+                              symbol, interval)
+
+    streams = "/".join(
+        f"{symbol.lower()}@kline_{interval}"
+        for symbol in symbols for interval in INTERVALS
+    )
+    url = f"wss://data-stream.binance.vision:443/stream?streams={streams}"
+
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=60,
-                                          close_timeout=10, max_size=2**20) as ws:
-                log.info("Connected to Binance streams: %s", BINANCE_SYMBOLS)
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=60,
+                close_timeout=10, open_timeout=20, max_size=2**20
+            ) as ws:
+                log.info("Connected to Binance public market-data streams: %s", symbols)
                 async for raw in ws:
-                    import json
                     packet = json.loads(raw)
                     item = packet.get("data", {})
-                    symbol = item.get("s", "")
-                    price = float(item.get("c", 0) or 0)
-                    change = float(item.get("P", 0) or 0)
-                    if not symbol or price <= 0:
+                    kline = item.get("k")
+                    if not kline or not kline.get("x"):
+                        continue  # Only evaluate fully closed candles.
+
+                    symbol = item.get("s", "").upper()
+                    interval = kline.get("i")
+                    if symbol not in histories or interval not in INTERVALS:
                         continue
-                    previous = last_prices.get(symbol)
-                    last_prices[symbol] = price
-                    # 24h change threshold is a broad alert, not a trade signal.
-                    if abs(change) >= PRICE_CHANGE_PCT:
-                        key = fingerprint(f"binance:{symbol}:{round(change,1)}:{int(time.time()//1800)}")
-                        if key not in seen:
-                            seen.add(key)
-                            direction = "рост" if change > 0 else "падение"
-                            await telegram_send_http(
-                                f"📊 BOGDAN INTELLIGENCE | CRYPTO MOVE\n"
-                                f"Актив: {symbol}\nЦена: {price}\n"
-                                f"Изменение за 24 часа: {change:+.2f}% ({direction})\n"
-                                f"Время: {utc_now()}\n"
-                                f"Источник: Binance Spot ticker stream\n"
-                                f"Это рыночное движение, а не подтверждённый торговый сигнал.")
-        except Exception:
-            log.exception("Binance websocket disconnected; reconnecting in 5 sec")
-            await asyncio.sleep(5)
+
+                    candle = {
+                        "open_time": int(kline["t"]),
+                        "open": float(kline["o"]),
+                        "high": float(kline["h"]),
+                        "low": float(kline["l"]),
+                        "close": float(kline["c"]),
+                        "volume": float(kline["v"]),
+                        "close_time": int(kline["T"]),
+                    }
+                    store_closed_candle(histories[symbol][interval], candle)
+
+                    # A new setup is checked only when a 5m candle has closed.
+                    if interval != "5m":
+                        continue
+
+                    signal = evaluate(symbol, histories[symbol])
+                    if not signal:
+                        continue
+
+                    now = time.time()
+                    previous = last_signal_sent.get(symbol)
+                    if previous:
+                        cooldown = (SIGNAL_SAME_SIDE_COOLDOWN
+                                    if previous["side"] == signal["side"]
+                                    else SIGNAL_FLIP_COOLDOWN)
+                        if now - previous["sent_at"] < cooldown:
+                            continue
+
+                    await telegram_send(session, format_signal(signal))
+                    last_signal_sent[symbol] = {
+                        "side": signal["side"],
+                        "sent_at": now,
+                        "candle_id": signal["candle_id"],
+                    }
+                    log.info("Delivered %s signal for %s, confidence=%s",
+                             signal["side"], symbol, signal["confidence"])
+
+        except Exception as exc:
+            log.exception("Binance signal feed disconnected (%s); retrying in 15 sec",
+                          type(exc).__name__)
+            await asyncio.sleep(15)
+
 
 async def telegram_send_http(text):
     timeout = aiohttp.ClientTimeout(total=15)
@@ -238,11 +332,19 @@ async def telegram_send_http(text):
 
 async def main():
     if not BOT_TOKEN or not CHAT_ID:
-        log.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to enable delivery.")
+        log.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway variables.")
     timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(limit=20)
+    connector = aiohttp.TCPConnector(limit=30)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await asyncio.gather(sec_monitor(session), rss_monitor(session), binance_monitor())
+        tasks = [binance_monitor(session)]
+        if ENABLE_SEC_ALERTS:
+            tasks.append(sec_monitor(session))
+        if ENABLE_RSS_ALERTS and RSS_FEEDS:
+            tasks.append(rss_monitor(session))
+        log.info("Starting signal engine. SEC alerts=%s, RSS alerts=%s",
+                 ENABLE_SEC_ALERTS, ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
+        await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
