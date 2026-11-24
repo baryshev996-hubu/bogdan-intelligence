@@ -158,7 +158,7 @@ class PaperBook:
                 self._close_trade(symbol, "BREAKEVEN")
                 return
         if trade["tp1"] and not trade["tp2"] and touched(t2):
-            self._exit(trade, t2, 0.60, "TP2")  # 60% of remaining = 30% of original
+            self._exit(trade, t2, 0.30, "TP2")  # 60% of the 50% remaining = 30% of original
             trade["tp2"] = True
             trade["active_stop"] = t1
             if (low <= t1 if side == "LONG" else high >= t1):
