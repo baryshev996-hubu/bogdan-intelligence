@@ -368,12 +368,6 @@ async def binance_monitor(session):
                     if not signal:
                         continue
 
-                    # Paper-trade the same validated signal universe. No exchange order is sent.
-                    if symbol in SIGNAL_DELIVERY_SYMBOLS:
-                        opened = paper_book.open_trade(signal)
-                        if opened:
-                            log.info("PAPER STATUS | %s", paper_book.status())
-
                     now = time.time()
                     previous = last_signal_sent.get(symbol)
                     if previous:
@@ -382,6 +376,12 @@ async def binance_monitor(session):
                                     else SIGNAL_FLIP_COOLDOWN)
                         if now - previous["sent_at"] < cooldown:
                             continue
+
+                    # Paper-trade the same validated signal universe. No exchange order is sent.
+                    if symbol in SIGNAL_DELIVERY_SYMBOLS:
+                        opened = paper_book.open_trade(signal)
+                        if opened:
+                            log.info("PAPER STATUS | %s", paper_book.status())
 
                     if symbol not in SIGNAL_DELIVERY_SYMBOLS:
                         log.info("SHADOW ONLY %s %s; excluded by historical validation",
