@@ -46,12 +46,12 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 BINANCE_SYMBOLS = [
     item.strip().upper()
-    for item in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT").split(",")
+    for item in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,LTCUSDT,BCHUSDT,TRXUSDT,ETCUSDT,XLMUSDT,SUIUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,INJUSDT,UNIUSDT,FILUSDT,AAVEUSDT,RENDERUSDT,TAOUSDT,HBARUSDT,1000PEPEUSDT,1000SHIBUSDT,ATOMUSDT").split(",")
     if item.strip()
 ]
 SIGNAL_DELIVERY_SYMBOLS = {
     item.strip().upper()
-    for item in os.getenv("SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT").split(",")
+    for item in os.getenv("SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,LTCUSDT,BCHUSDT,TRXUSDT,ETCUSDT,XLMUSDT,SUIUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,INJUSDT,UNIUSDT,FILUSDT,AAVEUSDT,RENDERUSDT,TAOUSDT,HBARUSDT,1000PEPEUSDT,1000SHIBUSDT,ATOMUSDT").split(",")
     if item.strip()
 }
 ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
@@ -60,7 +60,7 @@ ENABLE_ORDER_FLOW = os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true"
 ENABLE_ARKHAM = os.getenv("ENABLE_ARKHAM", "false").lower() == "true"
 ENABLE_UPCOMING_LISTINGS = os.getenv("ENABLE_UPCOMING_LISTINGS", "true").lower() == "true"
 AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
-MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "12"))))
+MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "0"))))
 SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600")))
 SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600")))
 
@@ -205,7 +205,7 @@ async def discover_trading_universe(session):
     pinned = set(BINANCE_SYMBOLS)
     if not pinned:
         return []
-    if not AUTO_DISCOVER_ALTS or MAX_DISCOVERED_ALTS == 0:
+    if not AUTO_DISCOVER_ALTS:
         return sorted(pinned)
 
     try:
@@ -226,6 +226,11 @@ async def discover_trading_universe(session):
             and not any(token in row.get("symbol", "") for token in ("USDC", "BUSD", "TUSD", "FDUSD"))
         }
 
+        valid_pinned = pinned & eligible
+        rejected = sorted(pinned - eligible)
+        if rejected:
+            log.warning("Configured symbols not currently tradable as USDT perpetuals: %s", rejected)
+
         ranked = []
         for row in tickers:
             symbol = row.get("symbol")
@@ -236,9 +241,11 @@ async def discover_trading_universe(session):
                     continue
 
         additions = [symbol for _, symbol in sorted(ranked, reverse=True)[:MAX_DISCOVERED_ALTS]]
-        universe = sorted(pinned | set(additions))
-        log.info("Trading universe ready | configured=%d discovered=%d total=%d",
-                 len(pinned), len(additions), len(universe))
+        universe = sorted(valid_pinned | set(additions))
+        if len(universe) < 21:
+            log.error("Trading universe below requested 21 markets | valid=%d", len(universe))
+        log.info("Trading universe ready | configured=%d valid=%d discovered=%d total=%d",
+                 len(pinned), len(valid_pinned), len(additions), len(universe))
         return universe
     except asyncio.CancelledError:
         raise
@@ -390,8 +397,8 @@ async def main():
     log.info("BOOT | strict Telegram allowlist enabled")
     log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
-    log.info("SIGNAL DELIVERY | enabled=%s | symbols=%s",
-             ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS))
+    log.info("SIGNAL DELIVERY | enabled=%s | symbols=%d | %s",
+             ENABLE_SIGNAL_DELIVERY, len(SIGNAL_DELIVERY_SYMBOLS), sorted(SIGNAL_DELIVERY_SYMBOLS))
     log.info("PAPER TRADING | %s", paper_book.status())
     log.info("PAPER SPRINT | %s", paper_sprint_book.status())
 
