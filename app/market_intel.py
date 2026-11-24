@@ -29,11 +29,12 @@ async def send(session, message):
     await telegram_send(session, message)
 
 async def derivatives_monitor(session, symbols=None):
+    watch_symbols = [s.upper() for s in symbols] if symbols else SYMBOLS
     gate = Gate()
     history = defaultdict(lambda: deque(maxlen=7))
     base = "https://fapi.binance.com"
     while True:
-        for symbol in SYMBOLS:
+        for symbol in watch_symbols:
             try:
                 async with session.get(base + "/fapi/v1/openInterest", params={"symbol": symbol}, timeout=12) as r:
                     r.raise_for_status()
@@ -68,8 +69,9 @@ async def derivatives_monitor(session, symbols=None):
                 log.exception("Binance derivatives monitor failed: %s", symbol)
         await asyncio.sleep(60)
 
-async def hyperliquid_whale_monitor(session):
-    if not COINS:
+async def hyperliquid_whale_monitor(session, coins=None):
+    watch_coins = [s.upper() for s in coins] if coins else COINS
+    if not watch_coins:
         return
     gate = Gate()
     url = "wss://api.hyperliquid.xyz/ws"
@@ -116,5 +118,11 @@ async def hyperliquid_whale_monitor(session):
             log.exception("Hyperliquid stream disconnected; reconnecting")
             await asyncio.sleep(10)
 
-async def run_market_intelligence(session):
-    await asyncio.gather(derivatives_monitor(session), hyperliquid_whale_monitor(session))
+async def run_market_intelligence(session, symbols=None):
+    selected = [s.upper() for s in symbols] if symbols else SYMBOLS
+    # Hyperliquid's public trade channel uses its own coin universe.
+    # Keep the verified major-coin list separate from Binance-discovered contracts.
+    await asyncio.gather(
+        derivatives_monitor(session, selected),
+        hyperliquid_whale_monitor(session, COINS),
+    )
