@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi
+from app.backtest import simulate_trade
 
 
 class SignalEngineTests(unittest.TestCase):
@@ -42,6 +43,28 @@ class SignalEngineTests(unittest.TestCase):
         }
         history = {tf: [dict(candle) for _ in range(60)] for tf in ("5m", "15m", "1h")}
         self.assertIsNone(evaluate("BTCUSDT", history, as_of_ms=now_ms))
+
+
+    def test_backtest_long_full_targets(self):
+        signal = {"side": "LONG", "entry": 100.0, "stop": 98.0,
+                  "targets": [102.0, 104.0, 106.0]}
+        future = [{"low": 103.0, "high": 107.0, "close": 106.5}]
+        result, _ = simulate_trade(signal, future)
+        self.assertAlmostEqual(result, 1.7)
+
+    def test_backtest_stop_first_when_stop_and_target_share_candle(self):
+        signal = {"side": "LONG", "entry": 100.0, "stop": 98.0,
+                  "targets": [102.0, 104.0, 106.0]}
+        future = [{"low": 97.5, "high": 103.0, "close": 100.0}]
+        result, _ = simulate_trade(signal, future)
+        self.assertAlmostEqual(result, -1.0)
+
+    def test_backtest_short_partial_exit(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 96.0, 94.0]}
+        future = [{"low": 97.5, "high": 100.5, "close": 98.0}]
+        result, _ = simulate_trade(signal, future)
+        self.assertAlmostEqual(result, 0.5)
 
     def test_signal_message_has_trade_levels_and_no_execution_claim(self):
         signal = {
