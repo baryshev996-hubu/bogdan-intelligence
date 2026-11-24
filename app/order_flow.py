@@ -13,11 +13,11 @@ import websockets
 
 log = logging.getLogger("bogdan-intel.order-flow")
 
-MIN_WALL_USD = float(os.getenv("ORDER_FLOW_MIN_WALL_USD", "500000"))
-MIN_PERSISTENCE = float(os.getenv("ORDER_FLOW_MIN_PERSISTENCE_SEC", "3"))
-MAX_DISTANCE_PCT = float(os.getenv("ORDER_FLOW_MAX_DISTANCE_PCT", "0.70"))
-MIN_AGGRESSOR_USD = float(os.getenv("ORDER_FLOW_MIN_AGGRESSOR_USD", "150000"))
-COOLDOWN = int(os.getenv("ORDER_FLOW_ALERT_COOLDOWN", "600"))
+MIN_WALL_USD = float(os.getenv("ORDER_FLOW_MIN_WALL_USD", "750000"))
+MIN_PERSISTENCE = float(os.getenv("ORDER_FLOW_MIN_PERSISTENCE_SEC", "5"))
+MAX_DISTANCE_PCT = float(os.getenv("ORDER_FLOW_MAX_DISTANCE_PCT", "0.35"))
+MIN_AGGRESSOR_USD = float(os.getenv("ORDER_FLOW_MIN_AGGRESSOR_USD", "250000"))
+COOLDOWN = int(os.getenv("ORDER_FLOW_ALERT_COOLDOWN", "900"))
 FLOW_WINDOW = 10
 MISSING_GRACE = 1.5
 
@@ -134,24 +134,25 @@ async def run_order_flow_monitor(session, symbols):
                         )
                         action = "ПОТЕНЦИАЛЬНАЯ ЗОНА СПРОСА" if side == "BID" else "ПОТЕНЦИАЛЬНАЯ ЗОНА ПРЕДЛОЖЕНИЯ"
                         confirmation = ""
-                        if absorption:
-                            action = "ВОЗМОЖНОЕ ПОГЛОЩЕНИЕ ПРОДАЖ, СЛЕДИТЬ ЗА LONG" if side == "BID" else "ВОЗМОЖНОЕ ПОГЛОЩЕНИЕ ПОКУПОК, СЛЕДИТЬ ЗА SHORT"
-                            confirmation = (
-                                "\nАгрессивные BUY за 10с: " + _fmt_usd(buy_usd)
-                                + "\nАгрессивные SELL за 10с: " + _fmt_usd(sell_usd)
-                            )
-                            state["flow_sent"] = True
-
-                        alert_key = "wall:" + symbol + ":" + side + ":" + str(round(key[2], 8))
+                        # A wall alone is not actionable. Alert only when aggressive
+                        # opposite-side executions show meaningful absorption.
+                        if not absorption:
+                            continue
+                        action = "ВОЗМОЖНОЕ ПОГЛОЩЕНИЕ ПРОДАЖ, LONG-КОНТЕКСТ" if side == "BID" else "ВОЗМОЖНОЕ ПОГЛОЩЕНИЕ ПОКУПОК, SHORT-КОНТЕКСТ"
+                        confirmation = (
+                            "\nАгрессивные BUY за 10с: " + _fmt_usd(buy_usd)
+                            + "\nАгрессивные SELL за 10с: " + _fmt_usd(sell_usd)
+                        )
+                        alert_key = "side:" + symbol + ":" + side
                         if now - cooldowns.get(alert_key, 0) < COOLDOWN:
-                            state["watch_sent"] = True
                             continue
                         cooldowns[alert_key] = now
                         state["watch_sent"] = True
+                        state["flow_sent"] = True
                         state["alerted_at"] = now
                         await _send(session,
                             "🧭 ORDER FLOW INTELLIGENCE | " + symbol + "\n"
-                            + "Событие: " + ("КРУПНАЯ BID-СТЕНА" if side == "BID" else "КРУПНАЯ ASK-СТЕНА") + "\n"
+                            + "Событие: " + ("BID-СТЕНА + ПОГЛОЩЕНИЕ ПРОДАЖ" if side == "BID" else "ASK-СТЕНА + ПОГЛОЩЕНИЕ ПОКУПОК") + "\n"
                             + "Уровень: " + _fmt_price(key[2]) + "\n"
                             + "Объём заявки: " + _fmt_usd(notional) + "\n"
                             + "Расстояние до цены: " + format(distance, ".3f") + "%\n"
@@ -167,15 +168,7 @@ async def run_order_flow_monitor(session, symbols):
                             continue
                         if now - state["last"] < MISSING_GRACE:
                             continue
-                        if state.get("watch_sent"):
-                            await _send(session,
-                                "🧭 ORDER FLOW INTELLIGENCE | " + symbol + "\n"
-                                + "Событие: УРОВЕНЬ БОЛЬШЕ НЕ ВИДЕН В TOP-20\n"
-                                + "Сторона: " + key[1] + "\n"
-                                + "Уровень: " + _fmt_price(key[2]) + "\n"
-                                + "Последний объём: " + _fmt_usd(state["max_usd"]) + "\n"
-                                + "Статус: прежняя зона больше не подтверждается стаканом. Пересмотреть вход/удержание позиции."
-                            )
+                        # A disappearing top-20 level is not sent separately.
                         del walls[key]
 
         except asyncio.CancelledError:
