@@ -1,4 +1,7 @@
-"""Historical, conservative backtest for the live Futures signal rules."""
+"""Historical, conservative backtest for the live Futures signal rules.
+
+Diagnostic only. It never places orders or changes account state.
+"""
 import asyncio
 import bisect
 import logging
