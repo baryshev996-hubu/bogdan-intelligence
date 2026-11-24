@@ -100,14 +100,23 @@ def _save_seen(seen):
 
 
 async def _json_get(session, url, params=None):
-    async with session.get(url, params=params, headers={"User-Agent": "BOGDAN-INTELLIGENCE/1.0"}, timeout=18) as response:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; BOGDAN-INTELLIGENCE/1.0)",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.binance.com/en/support/announcement/list/48",
+    }
+    async with session.get(url, params=params, headers=headers, timeout=18) as response:
         response.raise_for_status()
         return await response.json(content_type=None)
 
 
 async def _binance_listings(session):
     url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-    data = await _json_get(session, url, {"type": 1, "pageNo": 1, "pageSize": 30, "catalogId": 48})
+    # Binance's current CMS API expects category, not the obsolete catalogId.
+    data = await _json_get(
+        session, url, {"type": 1, "pageNo": 1, "pageSize": 30, "category": 48}
+    )
     result = data.get("data") or {}
     catalogs = result.get("catalogs") or []
     articles = []
@@ -259,11 +268,14 @@ async def run_upcoming_listings_monitor(session):
             ("OKX", _okx_listings),
         ):
             try:
-                gathered.extend(await fetcher(session))
+                events = await fetcher(session)
+                gathered.extend(events)
+                log.info("LISTING SOURCE OK | %s | events=%d", name, len(events))
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.exception("Listing source unavailable: %s", name)
+            except Exception as exc:
+                log.warning("LISTING SOURCE DEGRADED | %s | %s: %s",
+                            name, type(exc).__name__, str(exc)[:240])
 
         now = datetime.now(timezone.utc)
         horizon = now.timestamp() + LOOKAHEAD_HOURS * 3600
@@ -293,4 +305,7 @@ async def run_upcoming_listings_monitor(session):
                 _save_seen(seen)
                 log.info("UPCOMING LISTING SENT | %s | %s | %s | event_score=%s",
                          event["exchange"], event["ticker"], event["when"].isoformat(), score)
+            else:
+                log.warning("UPCOMING LISTING NOT DELIVERED | %s | %s",
+                            event["exchange"], event["ticker"])
         await asyncio.sleep(POLL_SECONDS)
