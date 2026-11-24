@@ -24,36 +24,47 @@ def _now():
 
 
 class PaperBook:
-    def __init__(self):
+    def __init__(self, *, path=None, start_balance=None, risk_fraction=None,
+                 max_open=None, max_gross_leverage=None, fee_rate=None,
+                 ends_at=None, label="10-day"):
+        self.path = path or PATH
+        self.start_balance = START_BALANCE if start_balance is None else float(start_balance)
+        self.risk_fraction = RISK_FRACTION if risk_fraction is None else float(risk_fraction)
+        self.max_open = MAX_OPEN if max_open is None else int(max_open)
+        self.max_gross_leverage = MAX_GROSS_LEVERAGE if max_gross_leverage is None else float(max_gross_leverage)
+        self.fee_rate = FEE_RATE if fee_rate is None else float(fee_rate)
+        self.ends_at = ends_at
+        self.label = label
         self.state = self._load()
 
     def _fresh(self):
         now = _now()
         return {
-            "version": 1, "started_at": now, "ends_at": now + DURATION_SECONDS,
-            "starting_balance": START_BALANCE, "balance": START_BALANCE,
+            "version": 1, "started_at": now, "ends_at": self.ends_at or now + DURATION_SECONDS,
+            "starting_balance": self.start_balance, "balance": self.start_balance,
             "closed_trades": [], "open_trades": {}, "summary_logged": False
         }
 
     def _load(self):
         try:
-            with open(PATH, "r", encoding="utf-8") as f:
+            with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("version") != 1:
                 raise ValueError("Unknown paper ledger version")
             return data
         except FileNotFoundError:
-            os.makedirs(os.path.dirname(PATH) or ".", exist_ok=True)
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             data = self._fresh()
             self._save_data(data)
-            log.info("PAPER START | balance=$%.2f | duration=10 days | risk=%.2f%% per trade",
-                     START_BALANCE, RISK_FRACTION * 100)
+            log.info("PAPER START | account=%s | balance=$%.2f | ends_at=%s | risk=%.2f%% | max_gross=%.2fx",
+                     self.label, self.start_balance, data["ends_at"], self.risk_fraction * 100,
+                     self.max_gross_leverage)
             return data
 
     def _save_data(self, data=None):
         data = self.state if data is None else data
         os.makedirs(os.path.dirname(PATH) or ".", exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix="paper-", dir=os.path.dirname(PATH) or ".")
+        fd, tmp = tempfile.mkstemp(prefix="paper-", dir=os.path.dirname(self.path) or ".")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
@@ -80,14 +91,17 @@ class PaperBook:
         distance = abs(entry - stop)
         if entry <= 0 or distance <= 0:
             return False
-        risk_budget = equity * RISK_FRACTION
+        risk_budget = equity * self.risk_fraction
         qty = risk_budget / distance
-        max_notional = equity * MAX_GROSS_LEVERAGE
-        qty = min(qty, max_notional / entry)
+        current_gross = sum(float(t["remaining"]) * float(t["entry"])
+                            for t in self.state["open_trades"].values())
+        max_gross = equity * self.max_gross_leverage
+        remaining_capacity = max(0.0, max_gross - current_gross)
+        qty = min(qty, remaining_capacity / entry)
         notional = qty * entry
         if qty <= 0:
             return False
-        fee = notional * FEE_RATE
+        fee = notional * self.fee_rate
         self.state["balance"] -= fee
         self.state["open_trades"][symbol] = {
             "symbol": symbol, "side": signal["side"], "entry": entry,
@@ -109,7 +123,7 @@ class PaperBook:
             return
         direction = 1 if trade["side"] == "LONG" else -1
         gross = (price - trade["entry"]) * qty * direction
-        fee = price * qty * FEE_RATE
+        fee = price * qty * self.fee_rate
         trade["gross_realized"] += gross
         trade["exit_fees"] += fee
         trade["remaining"] -= qty
