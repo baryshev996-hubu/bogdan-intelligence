@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from collections import deque
 
 import aiohttp
@@ -17,7 +18,18 @@ from dotenv import load_dotenv
 
 from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
 from app.market_intel import run_market_intelligence
-from app.paper_trader import paper_book
+from app.paper_trader import PaperBook, paper_book
+
+# Separate short sprint. 09:00 Kyiv time on 25 Nov 2026 = 07:00 UTC.
+paper_sprint_book = PaperBook(
+    path="/data/paper_sprint_20261125.json",
+    start_balance=100.0,
+    risk_fraction=0.01,
+    max_open=3,
+    max_gross_leverage=3.0,
+    ends_at=int(datetime(2026, 11, 25, 7, 0, tzinfo=timezone.utc).timestamp()),
+    label="09:00 sprint",
+)
 
 load_dotenv()
 
@@ -299,6 +311,7 @@ async def binance_signal_monitor(session, symbols):
 
                     # Manage virtual positions only after a 5m candle has closed.
                     paper_book.on_candle(symbol, candle)
+                    paper_sprint_book.on_candle(symbol, candle)
 
                     signal = evaluate(symbol, histories[symbol])
                     if not signal:
@@ -330,6 +343,10 @@ async def binance_signal_monitor(session, symbols):
                         opened = paper_book.open_trade(signal)
                         if opened:
                             log.info("PAPER STATUS | %s", paper_book.status())
+                    if paper_sprint_book.active():
+                        sprint_opened = paper_sprint_book.open_trade(signal)
+                        if sprint_opened:
+                            log.info("PAPER SPRINT STATUS | %s", paper_sprint_book.status())
 
                     if not ENABLE_SIGNAL_DELIVERY:
                         log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s",
@@ -369,6 +386,7 @@ async def main():
     log.info("SIGNAL DELIVERY | enabled=%s | symbols=%s",
              ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS))
     log.info("PAPER TRADING | %s", paper_book.status())
+    log.info("PAPER SPRINT | %s", paper_sprint_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         universe = await discover_trading_universe(session)
