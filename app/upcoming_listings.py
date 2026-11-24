@@ -126,7 +126,7 @@ async def _binance_listing_page(session):
 
     found = {}
     href_pattern = re.compile(
-        r'href=["\\'](?P<href>[^"\\']*/support/announcement/detail/(?P<code>[a-f0-9]{32})[^"\\']*)["\\']',
+        r"""href=["'](?P<href>[^"']*/support/announcement/detail/(?P<code>[a-f0-9]{32})[^"']*)["']""",
         re.I,
     )
     for match in href_pattern.finditer(page):
@@ -145,8 +145,8 @@ async def _binance_listing_page(session):
 
     # Next.js payload fallback: article code/title may be embedded without an anchor.
     if not found:
-        code_matches = re.findall(r'"code"\\s*:\\s*"([a-f0-9]{32})"', page, re.I)
-        title_matches = re.findall(r'"title"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', page)
+        code_matches = re.findall(r'"code"\s*:\s*"([a-f0-9]{32})"', page, re.I)
+        title_matches = re.findall(r'"title"\s*:\s*"((?:\\.|[^"\\])*)"', page)
         for code, title in zip(code_matches, title_matches):
             clean_title = _clean(title.encode("utf-8").decode("unicode_escape"))
             if clean_title:
