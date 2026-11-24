@@ -122,12 +122,12 @@ async def hyperliquid_whale_monitor(session, coins=None):
                             avg_price = sum(row[1] * row[2] for row in bucket) / max(total, 1)
                             last_alert[key] = now
                             await send(session,
-                                "🐳 LARGE EXECUTION | HYPERLIQUID | " + coin + "\\n"
-                                + "Taker: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\\n"
-                                + "Агрегированный поток: $" + format(total, ",.0f") + "\\n"
-                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\\n"
-                                + "Средневзвешенная цена: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\\n"
-                                + "Окно: " + str(WHALE_WINDOW_SECONDS) + " сек. | сделок: " + str(len(bucket)) + "\\n"
+                                "🐳 LARGE EXECUTION | HYPERLIQUID | " + coin + "\n"
+                                + "Taker: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\n"
+                                + "Агрегированный поток: $" + format(total, ",.0f") + "\n"
+                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\n"
+                                + "Средневзвешенная цена: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\n"
+                                + "Окно: " + str(WHALE_WINDOW_SECONDS) + " сек. | сделок: " + str(len(bucket)) + "\n"
                                 + "Источник: публичная лента Hyperliquid. Это поток агрессивных сделок, не подтверждение личности или намерений участника."
                             )
                             log.info("HYPERLIQUID FLOW ALERT | %s %s | usd=%.0f | prints=%d",
