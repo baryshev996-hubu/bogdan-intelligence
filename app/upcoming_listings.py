@@ -48,15 +48,17 @@ def _parse_explicit_utc(text):
     """Parse only timestamps that explicitly state UTC/GMT."""
     text = _clean(text)
     patterns = [
-        r"(20\d{2}-\d{2}-\d{2})[ T]+(\d{1,2}:\d{2})(?::\d{2})?\s*(?:UTC|GMT)",
-        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})[, ]+(\d{1,2}:\d{2})(?::\d{2})?\s*(?:UTC|GMT)",
-        r"([A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2})[, ]+(\d{1,2}:\d{2})(?::\d{2})?\s*(?:UTC|GMT)",
+        (r"(20\d{2}-\d{2}-\d{2})[ T]+(\d{1,2}:\d{2})(?::\d{2})?\s*\(?\s*(?:UTC|GMT)\s*\)?", False),
+        (r"(\d{1,2}\s+[A-Za-z]{3,9}\s+20\d{2})[, ]+(\d{1,2}:\d{2})(?::\d{2})?\s*\(?\s*(?:UTC|GMT)\s*\)?", False),
+        (r"([A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2})[, ]+(\d{1,2}:\d{2})(?::\d{2})?\s*\(?\s*(?:UTC|GMT)\s*\)?", False),
+        (r"(\d{1,2}:\d{2})(?::\d{2})?\s*\(?\s*(?:UTC|GMT)\s*\)?\s*(?:on\s+)?(20\d{2}-\d{2}-\d{2})", True),
+        (r"(\d{1,2}:\d{2})(?::\d{2})?\s*\(?\s*(?:UTC|GMT)\s*\)?\s*(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+20\d{2})", True),
     ]
-    for pattern in patterns:
+    for pattern, reverse in patterns:
         match = re.search(pattern, text, re.I)
         if not match:
             continue
-        date_part, time_part = match.group(1), match.group(2)
+        date_part, time_part = (match.group(2), match.group(1)) if reverse else (match.group(1), match.group(2))
         for fmt in ("%Y-%m-%d %H:%M", "%d %b %Y %H:%M", "%d %B %Y %H:%M",
                     "%b %d, %Y %H:%M", "%B %d, %Y %H:%M", "%b %d %Y %H:%M",
                     "%B %d %Y %H:%M"):
