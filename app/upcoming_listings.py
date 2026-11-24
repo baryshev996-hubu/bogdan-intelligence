@@ -115,7 +115,7 @@ async def _binance_listings(session):
     url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
     # Binance's current CMS API expects category, not the obsolete catalogId.
     data = await _json_get(
-        session, url, {"type": 1, "pageNo": 1, "pageSize": 30, "category": 48}
+        session, url, {"type": 1, "pageNo": 1, "pageSize": 20, "category": 48}
     )
     result = data.get("data") or {}
     catalogs = result.get("catalogs") or []
@@ -130,7 +130,7 @@ async def _binance_listings(session):
         code = str(item.get("code") or item.get("id") or "")
         if not code:
             continue
-        detail_url = "https://www.binance.com/en/support/announcement/detail/" + code
+        detail_url = "https://www.binance.com/en/support/announcement/" + code
         detail_text = ""
         try:
             detail = await _json_get(
