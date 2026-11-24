@@ -19,6 +19,8 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
     "BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt"
 ).split(",") if s.strip()]
 LIMIT = 1500
+LOOKBACK_DAYS = 14
+INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 HORIZON_BARS = 144  # 12 hours of 5m candles
 SAME_SIDE_COOLDOWN_MS = 6 * 60 * 60 * 1000
 FLIP_COOLDOWN_MS = 60 * 60 * 1000
@@ -28,26 +30,46 @@ SLIPPAGE_RATE = float(os.getenv("BACKTEST_SLIPPAGE", "0.0001"))
 
 async def fetch_candles(session, symbol, interval):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": LIMIT}
-    async with session.get(url, params=params, timeout=30) as response:
-        response.raise_for_status()
-        rows = await response.json(content_type=None)
-
+    end_ms = int(time.time() * 1000)
+    cursor = end_ms - LOOKBACK_DAYS * 24 * 60 * 60 * 1000
     candles = []
-    now_ms = int(time.time() * 1000)
-    for row in rows:
-        if int(row[6]) >= now_ms:
-            continue
-        candles.append({
-            "open_time": int(row[0]),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
-            "close_time": int(row[6]),
-        })
-    return candles
+
+    while cursor < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor,
+            "endTime": end_ms,
+            "limit": LIMIT,
+        }
+        async with session.get(url, params=params, timeout=30) as response:
+            response.raise_for_status()
+            rows = await response.json(content_type=None)
+        if not rows:
+            break
+
+        for row in rows:
+            close_time = int(row[6])
+            if close_time >= end_ms:
+                continue
+            candles.append({
+                "open_time": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+                "close_time": close_time,
+            })
+
+        next_cursor = int(rows[-1][0]) + INTERVAL_MS[interval]
+        if next_cursor <= cursor or len(rows) < LIMIT:
+            break
+        cursor = next_cursor
+
+    # De-duplicate by open time and preserve chronological order.
+    unique = {c["open_time"]: c for c in candles}
+    return [unique[key] for key in sorted(unique)]
 
 
 def simulate_trade(signal, future_candles):
@@ -147,9 +169,9 @@ def backtest_symbol(symbol, data):
             continue
 
         signal = evaluate(symbol, {
-            "5m": five[:index + 1],
-            "15m": fifteen[:j15],
-            "1h": hourly[:j1h],
+            "5m": five[max(0, index + 1 - 240):index + 1],
+            "15m": fifteen[max(0, j15 - 240):j15],
+            "1h": hourly[max(0, j1h - 240):j1h],
         }, as_of_ms=as_of)
         if not signal:
             index += 1
