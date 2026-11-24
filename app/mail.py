@@ -74,7 +74,8 @@ def is_allowed_telegram_alert(message):
         "LARGE EXECUTION | HYPERLIQUID |" in normalized
         and any(line.strip().startswith(("TAKER: BUY", "TAKER: SELL")) for line in normalized.splitlines())
     )
-    return signal or large_execution
+    order_flow = "ORDER FLOW INTELLIGENCE |" in normalized
+    return signal or large_execution or order_flow
 
 
 async def telegram_send(session, text):
