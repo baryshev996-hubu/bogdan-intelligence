@@ -406,7 +406,7 @@ async def main():
         if os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true" and symbols:
             tasks.append(market_intel_monitor(session, symbols))
         if ENABLE_MARKET_INTEL:
-            tasks.append(run_market_intelligence(session))
+            tasks.append(run_market_intelligence(session, symbols))
         if ENABLE_SEC_ALERTS:
             tasks.append(sec_monitor(session))
         if ENABLE_RSS_ALERTS and RSS_FEEDS:
