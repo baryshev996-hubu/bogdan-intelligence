@@ -25,7 +25,7 @@ KYIV = ZoneInfo("Europe/Kyiv")
 
 EXCLUDED = (
     "tokenized stock", "tokenised stock", "pre-ipo", "tradfi", "stock token",
-    "leveraged token", " etf", "delist", "margin trading", "earn", "convert",
+    "leveraged token", " etf", "delist", "removal of", "will remove", "margin trading", "earn", "convert",
     "launchpool", "launchpool subscription", "equity", "equities", "stock",
 )
 
