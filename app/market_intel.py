@@ -121,6 +121,9 @@ async def hyperliquid_whale_monitor(session, coins=None):
             await asyncio.sleep(10)
 
 async def run_market_intelligence(session, symbols=None):
-    # Deliver only large public BUY/SELL executions. OI and funding alerts are
-    # intentionally not started because they are context, not trade signals.
-    await hyperliquid_whale_monitor(session, COINS)
+    # Keep whale executions and order-book intelligence as independent monitors.
+    from app.order_flow import run_order_flow_monitor
+    tasks = [hyperliquid_whale_monitor(session, COINS)]
+    if os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true":
+        tasks.append(run_order_flow_monitor(session, symbols or SYMBOLS))
+    await asyncio.gather(*tasks)
