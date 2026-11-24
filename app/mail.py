@@ -1,16 +1,17 @@
+"""BOGDAN INTELLIGENCE production entrypoint.
+
+Telegram is fail-closed: only LONG, SHORT, Hyperliquid large executions,
+and Binance Futures order-flow alerts can be delivered. No spot ticker,
+SEC, RSS, funding, OI, or generic market notifications are sent.
+"""
 import asyncio
-from collections import deque
-import hashlib
 import json
 import logging
 import os
 import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+from collections import deque
 
 import aiohttp
-import feedparser
 import websockets
 from dotenv import load_dotenv
 
@@ -19,233 +20,145 @@ from app.market_intel import run_market_intelligence
 from app.paper_trader import paper_book
 
 load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s %(levelname)s %(message)s")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 log = logging.getLogger("bogdan-intel")
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "BogdanIntelligence/0.1 contact@example.com")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "45"))
-PRICE_CHANGE_PCT = float(os.getenv("PRICE_CHANGE_PCT", "2.0"))
-WATCH_TICKERS = [x.strip().upper() for x in os.getenv(
-    "SEC_TICKERS", "AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL,META,COIN").split(",") if x.strip()]
-BINANCE_SYMBOLS = [x.strip().lower() for x in os.getenv(
-    "BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt").split(",") if x.strip()]
-RSS_FEEDS = [x.strip() for x in os.getenv("RSS_FEEDS", "").split(",") if x.strip()]
-ENABLE_SEC_ALERTS = os.getenv("ENABLE_SEC_ALERTS", "false").lower() == "true"
-ENABLE_RSS_ALERTS = os.getenv("ENABLE_RSS_ALERTS", "false").lower() == "true"
-SIGNAL_SAME_SIDE_COOLDOWN = int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600"))
-SIGNAL_FLIP_COOLDOWN = int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600"))
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+BINANCE_SYMBOLS = [
+    item.strip().upper()
+    for item in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT").split(",")
+    if item.strip()
+]
+SIGNAL_DELIVERY_SYMBOLS = {
+    item.strip().upper()
+    for item in os.getenv("SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT").split(",")
+    if item.strip()
+}
 ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
 ENABLE_MARKET_INTEL = os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true"
-SIGNAL_DELIVERY_SYMBOLS = {x.strip().upper() for x in os.getenv(
-    "SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT"
-).split(",") if x.strip()}
-
+ENABLE_ORDER_FLOW = os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true"
 AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
 MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "12"))))
-INTEL_POLL_SECONDS = max(60, int(os.getenv("INTEL_POLL_SECONDS", "180")))
-INTEL_MIN_ALERT_SCORE = max(2, min(3, int(os.getenv("INTEL_MIN_ALERT_SCORE", "3"))))
-intel_last_alert = {}
+SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600")))
+SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600")))
 
-seen = set()
-last_prices = {}
-last_sec_check = {}
-ticker_to_cik = {}
 last_signal_sent = {}
-
 telegram_send_lock = asyncio.Lock()
 telegram_last_sent = 0.0
 
-def utc_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-def fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
-
-def is_allowed_telegram_alert(message):
-    """Fail-closed Telegram allowlist. Price/news/derivatives chatter is never delivered."""
-    lines = [line.strip().upper() for line in str(message).splitlines() if line.strip()]
+def is_allowed_telegram_alert(message: str) -> bool:
+    """Allow only the four explicitly approved alert families."""
+    lines = [line.strip() for line in str(message).splitlines() if line.strip()]
     if not lines:
         return False
-    if any("CRYPTO MOVE" in line or "BINANCE SPOT TICKER STREAM" in line for line in lines):
-        return False
-    header = lines[0]
-    if header in {"BOGDAN INTELLIGENCE | LONG", "BOGDAN INTELLIGENCE | SHORT"}:
+
+    header = lines[0].upper()
+    # Remove only the decorative icons used by our own formatters.
+    normalized = header.lstrip("🟢🔴🐳🧭⚡️🔥🚨 ")
+
+    if normalized in {
+        "BOGDAN INTELLIGENCE | LONG",
+        "BOGDAN INTELLIGENCE | SHORT",
+    }:
         return True
-    if header.startswith("LARGE EXECUTION | HYPERLIQUID |"):
-        return any(line.startswith(("TAKER: BUY", "TAKER: SELL")) for line in lines[1:])
-    if header.startswith("ORDER FLOW INTELLIGENCE |"):
+
+    if normalized.startswith("LARGE EXECUTION | HYPERLIQUID |"):
+        return any(
+            line.strip().upper() in {"TAKER: BUY 🟢", "TAKER: SELL 🔴", "TAKER: BUY", "TAKER: SELL"}
+            for line in lines[1:]
+        )
+
+    if normalized.startswith("ORDER FLOW INTELLIGENCE |"):
         return True
+
     return False
 
 
-async def telegram_send(session, text):
+async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
+    """Send only allowlisted alerts, with serialization and bounded retries."""
     global telegram_last_sent
-    if not is_allowed_telegram_alert(text):
-        log.info("Telegram alert suppressed by strict BUY/SELL/LONG/SHORT filter")
+
+    if not is_allowed_telegram_alert(message):
+        first_line = next((line.strip() for line in str(message).splitlines() if line.strip()), "<empty>")
+        log.info("TELEGRAM BLOCKED | header=%r", first_line[:120])
         return False
+
     if not BOT_TOKEN or not CHAT_ID:
-        log.warning("Telegram not configured. Alert was not sent:\n%s", text)
+        log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
         return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+    }
 
-    # Serialize all senders and respect Telegram's practical per-chat rate limit.
     async with telegram_send_lock:
         for attempt in range(4):
-            wait_for = 1.1 - (time.monotonic() - telegram_last_sent)
-            if wait_for > 0:
-                await asyncio.sleep(wait_for)
+            delay_to_rate_limit = 1.1 - (time.monotonic() - telegram_last_sent)
+            if delay_to_rate_limit > 0:
+                await asyncio.sleep(delay_to_rate_limit)
 
             try:
-                async with session.post(url, json=payload, timeout=20) as resp:
+                async with session.post(url, json=payload, timeout=20) as response:
+                    body = await response.json(content_type=None)
                     telegram_last_sent = time.monotonic()
-                    body = await resp.json(content_type=None)
 
-                    if resp.status == 200 and body.get("ok"):
+                    if response.status == 200 and body.get("ok") is True:
+                        log.info("TELEGRAM SENT | header=%r", message.splitlines()[0][:100])
                         return True
 
-                    if resp.status == 429:
+                    if response.status == 429:
                         retry_after = body.get("parameters", {}).get("retry_after", 2)
                         try:
                             retry_after = max(1, min(int(retry_after), 60))
                         except (TypeError, ValueError):
                             retry_after = 2
-                        log.warning("Telegram rate limited; retrying after %s seconds", retry_after)
                         if attempt < 3:
+                            log.warning("Telegram rate limited; retrying after %ss", retry_after)
                             await asyncio.sleep(retry_after)
                             continue
 
-                    if resp.status >= 500 and attempt < 3:
-                        delay = min(2 ** attempt, 15)
-                        log.warning("Telegram server error %s; retrying in %s seconds", resp.status, delay)
-                        await asyncio.sleep(delay)
+                    if response.status >= 500 and attempt < 3:
+                        backoff = min(2 ** attempt, 15)
+                        log.warning("Telegram HTTP %s; retrying in %ss", response.status, backoff)
+                        await asyncio.sleep(backoff)
                         continue
 
-                    log.error("Telegram API error (HTTP %s): %s", resp.status, body)
+                    log.error("Telegram rejected message: HTTP %s, response=%s", response.status, body)
                     return False
 
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 if attempt == 3:
                     log.exception("Telegram delivery failed after retries")
                     return False
-                delay = min(2 ** attempt, 15)
-                log.warning("Telegram network error; retrying in %s seconds", delay, exc_info=True)
-                await asyncio.sleep(delay)
+                backoff = min(2 ** attempt, 15)
+                log.warning("Telegram network error; retrying in %ss", backoff, exc_info=True)
+                await asyncio.sleep(backoff)
             except Exception:
                 log.exception("Unexpected Telegram delivery error")
                 return False
 
-async def load_ticker_map(session):
-    url = "https://www.sec.gov/files/company_tickers.json"
-    headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
-    async with session.get(url, headers=headers, timeout=25) as resp:
-        resp.raise_for_status()
-        data = await resp.json(content_type=None)
-    mapping = {}
-    for row in data.values():
-        mapping[str(row["ticker"]).upper()] = str(row["cik_str"]).zfill(10)
-    return mapping
+    return False
 
-async def sec_monitor(session):
-    global ticker_to_cik
-    while True:
-        try:
-            if not ticker_to_cik:
-                ticker_to_cik = await load_ticker_map(session)
-            for ticker in WATCH_TICKERS:
-                cik = ticker_to_cik.get(ticker)
-                if not cik:
-                    continue
-                url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-                headers = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
-                async with session.get(url, headers=headers, timeout=25) as resp:
-                    if resp.status == 429:
-                        log.warning("SEC rate limited; backing off")
-                        await asyncio.sleep(10)
-                        continue
-                    resp.raise_for_status()
-                    data = await resp.json(content_type=None)
-                recent = data.get("filings", {}).get("recent", {})
-                forms = recent.get("form", [])
-                dates = recent.get("filingDate", [])
-                accessions = recent.get("accessionNumber", [])
-                docs = recent.get("primaryDocument", [])
-                descriptions = recent.get("primaryDocDescription", [])
-                for i, form in enumerate(forms[:30]):
-                    if form not in {"8-K", "10-K", "10-Q", "S-1", "SC 13D", "SC 13G", "4", "6-K", "20-F"}:
-                        continue
-                    accession = accessions[i]
-                    key = fingerprint("sec:" + accession)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    doc = docs[i] if i < len(docs) else ""
-                    accession_clean = accession.replace("-", "")
-                    link = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_clean}/{doc}" if doc else f"https://www.sec.gov/edgar/browse/?CIK={cik}"
-                    desc = descriptions[i] if i < len(descriptions) else ""
-                    msg = (
-                        f"🟠 BOGDAN INTELLIGENCE | SEC FILING\n"
-                        f"Компания: {ticker}\nФорма: {form}\n"
-                        f"Дата подачи: {dates[i]}\n"
-                        f"Описание: {desc or 'Смотри первичный документ'}\n"
-                        f"Время обнаружения: {utc_now()}\n"
-                        f"Источник: {link}\n\n"
-                        f"Статус: новое официальное раскрытие. Направление влияния не определено автоматически."
-                    )
-                    await telegram_send(session, msg)
-                await asyncio.sleep(0.25)
-        except Exception:
-            log.exception("SEC monitor error")
-        await asyncio.sleep(POLL_SECONDS)
 
-async def rss_monitor(session):
-    while True:
-        for feed_url in RSS_FEEDS:
-            try:
-                async with session.get(feed_url, timeout=20) as resp:
-                    resp.raise_for_status()
-                    raw = await resp.read()
-                parsed = feedparser.parse(raw)
-                for entry in parsed.entries[:30]:
-                    title = entry.get("title", "").strip()
-                    link = entry.get("link", "")
-                    summary = entry.get("summary", "")
-                    if not title or not link:
-                        continue
-                    key = fingerprint("rss:" + link)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    # RSS is ingested, but MVP sends only headlines with configured high-impact keywords.
-                    haystack = (title + " " + summary).lower()
-                    keywords = ("fed", "rate decision", "sec", "lawsuit", "bankruptcy",
-                                "acquisition", "merger", "hack", "exploit", "halted",
-                                "sanction", "default", "emergency", "earnings warning")
-                    if any(word in haystack for word in keywords):
-                        await telegram_send(session,
-                            f"📰 BOGDAN INTELLIGENCE | NEWS CANDIDATE\n"
-                            f"{title}\n{link}\n"
-                            f"Источник: RSS, требует проверки первоисточника.\n"
-                            f"Обнаружено: {utc_now()}")
-            except Exception:
-                log.exception("RSS feed error: %s", feed_url)
-        await asyncio.sleep(max(POLL_SECONDS, 60))
-
-async def load_binance_history(session, symbol, interval):
+async def load_binance_history(session, symbol: str, interval: str):
     url = "https://fapi.binance.com/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": 200}
-    async with session.get(url, params=params, timeout=20) as resp:
-        if resp.status == 451:
-            raise RuntimeError("Binance market-data REST endpoint returned HTTP 451")
-        resp.raise_for_status()
-        rows = await resp.json(content_type=None)
+    async with session.get(url, params=params, timeout=20) as response:
+        response.raise_for_status()
+        rows = await response.json(content_type=None)
 
     now_ms = int(time.time() * 1000)
-    result = []
+    candles = []
     for row in rows:
         candle = {
             "open_time": int(row[0]),
@@ -257,8 +170,8 @@ async def load_binance_history(session, symbol, interval):
             "close_time": int(row[6]),
         }
         if candle["close_time"] < now_ms:
-            result.append(candle)
-    return result
+            candles.append(candle)
+    return candles
 
 
 def store_closed_candle(history, candle):
@@ -269,82 +182,105 @@ def store_closed_candle(history, candle):
 
 
 async def discover_trading_universe(session):
-    """Keep configured majors and add liquid USDT perpetuals."""
-    pinned = {s.upper() for s in BINANCE_SYMBOLS}
+    """Keep configured markets and optionally add the most liquid USDT perpetuals."""
+    pinned = set(BINANCE_SYMBOLS)
+    if not pinned:
+        return []
     if not AUTO_DISCOVER_ALTS or MAX_DISCOVERED_ALTS == 0:
         return sorted(pinned)
+
     try:
-        async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20) as resp:
-            resp.raise_for_status()
-            exchange = await resp.json(content_type=None)
-        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=20) as resp:
-            resp.raise_for_status()
-            tickers = await resp.json(content_type=None)
-        eligible = {row["symbol"] for row in exchange.get("symbols", [])
-                    if row.get("status") == "TRADING" and row.get("contractType") == "PERPETUAL"
-                    and row.get("quoteAsset") == "USDT" and row.get("symbol", "").endswith("USDT")
-                    and not any(x in row.get("symbol", "") for x in ("USDC", "BUSD", "TUSD", "FDUSD"))}
+        async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20) as response:
+            response.raise_for_status()
+            exchange = await response.json(content_type=None)
+        async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=20) as response:
+            response.raise_for_status()
+            tickers = await response.json(content_type=None)
+
+        eligible = {
+            row["symbol"]
+            for row in exchange.get("symbols", [])
+            if row.get("status") == "TRADING"
+            and row.get("contractType") == "PERPETUAL"
+            and row.get("quoteAsset") == "USDT"
+            and row.get("symbol", "").endswith("USDT")
+            and not any(token in row.get("symbol", "") for token in ("USDC", "BUSD", "TUSD", "FDUSD"))
+        }
+
         ranked = []
         for row in tickers:
-            if row.get("symbol") in eligible and row["symbol"] not in pinned:
+            symbol = row.get("symbol")
+            if symbol in eligible and symbol not in pinned:
                 try:
-                    ranked.append((float(row.get("quoteVolume", 0)), row["symbol"]))
+                    ranked.append((float(row.get("quoteVolume", 0)), symbol))
                 except (TypeError, ValueError):
-                    pass
-        additions = [s for _, s in sorted(ranked, reverse=True)[:MAX_DISCOVERED_ALTS]]
-        log.info("Trading universe: %s configured + %s liquid discovered alts", len(pinned), len(additions))
-        return sorted(pinned | set(additions))
+                    continue
+
+        additions = [symbol for _, symbol in sorted(ranked, reverse=True)[:MAX_DISCOVERED_ALTS]]
+        universe = sorted(pinned | set(additions))
+        log.info("Trading universe ready | configured=%d discovered=%d total=%d",
+                 len(pinned), len(additions), len(universe))
+        return universe
+    except asyncio.CancelledError:
+        raise
     except Exception:
         log.exception("Altcoin discovery failed; using configured symbols only")
         return sorted(pinned)
 
 
-async def binance_monitor(session):
-    if not BINANCE_SYMBOLS:
-        log.warning("No BINANCE_SYMBOLS configured; signal engine is idle.")
+async def binance_signal_monitor(session, symbols):
+    if not symbols:
+        log.error("Signal engine stopped: no Binance USD-M Futures symbols configured.")
         return
 
-    symbols = await discover_trading_universe(session)
     histories = {
-        symbol: {tf: deque(maxlen=MAX_CANDLES) for tf in INTERVALS}
+        symbol: {timeframe: deque(maxlen=MAX_CANDLES) for timeframe in INTERVALS}
         for symbol in symbols
     }
 
-    # Warm up indicators with closed historical candles before evaluating live setups.
+    # Load only completed candles. Never evaluate an unfinished candle.
     for symbol in symbols:
-        for interval in INTERVALS:
+        for timeframe in INTERVALS:
             try:
-                rows = await load_binance_history(session, symbol, interval)
-                histories[symbol][interval].extend(rows)
-                log.info("Loaded %s closed %s candles for %s",
-                         len(rows), interval, symbol)
+                rows = await load_binance_history(session, symbol, timeframe)
+                histories[symbol][timeframe].extend(rows)
+                log.info("HISTORY READY | %s | %s | %d closed candles",
+                         symbol, timeframe, len(rows))
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                log.exception("Could not load Binance history for %s %s",
-                              symbol, interval)
+                log.exception("History load failed | %s | %s", symbol, timeframe)
 
     streams = "/".join(
-        f"{symbol.lower()}@kline_{interval}"
-        for symbol in symbols for interval in INTERVALS
+        f"{symbol.lower()}@kline_{timeframe}"
+        for symbol in symbols
+        for timeframe in INTERVALS
     )
     url = f"wss://fstream.binance.com/market/stream?streams={streams}"
 
     while True:
         try:
             async with websockets.connect(
-                url, ping_interval=20, ping_timeout=60,
-                close_timeout=10, open_timeout=20, max_size=2**20
-            ) as ws:
-                log.info("Connected to Binance USD-M Futures market streams: %s", symbols)
-                async for raw in ws:
+                url,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=10,
+                open_timeout=20,
+                max_size=2**20,
+            ) as websocket:
+                log.info("BINANCE FUTURES CONNECTED | symbols=%d | intervals=%s",
+                         len(symbols), ",".join(INTERVALS))
+
+                async for raw in websocket:
                     packet = json.loads(raw)
                     item = packet.get("data", {})
                     kline = item.get("k")
                     if not kline or not kline.get("x"):
-                        continue  # Only evaluate fully closed candles.
+                        continue
 
-                    symbol = item.get("s", "").upper()
-                    interval = kline.get("i")
-                    if symbol not in histories or interval not in INTERVALS:
+                    symbol = str(item.get("s", "")).upper()
+                    timeframe = kline.get("i")
+                    if symbol not in histories or timeframe not in INTERVALS:
                         continue
 
                     candle = {
@@ -356,15 +292,13 @@ async def binance_monitor(session):
                         "volume": float(kline["v"]),
                         "close_time": int(kline["T"]),
                     }
-                    store_closed_candle(histories[symbol][interval], candle)
+                    store_closed_candle(histories[symbol][timeframe], candle)
 
-                    # Update virtual positions only on fully closed 5m candles.
-                    if interval == "5m":
-                        paper_book.on_candle(symbol, candle)
-
-                    # A new setup is checked only when a 5m candle has closed.
-                    if interval != "5m":
+                    if timeframe != "5m":
                         continue
+
+                    # Manage virtual positions only after a 5m candle has closed.
+                    paper_book.on_candle(symbol, candle)
 
                     signal = evaluate(symbol, histories[symbol])
                     if not signal:
@@ -373,75 +307,81 @@ async def binance_monitor(session):
                     now = time.time()
                     previous = last_signal_sent.get(symbol)
                     if previous:
-                        cooldown = (SIGNAL_SAME_SIDE_COOLDOWN
-                                    if previous["side"] == signal["side"]
-                                    else SIGNAL_FLIP_COOLDOWN)
+                        cooldown = (
+                            SIGNAL_SAME_SIDE_COOLDOWN
+                            if previous["side"] == signal["side"]
+                            else SIGNAL_FLIP_COOLDOWN
+                        )
                         if now - previous["sent_at"] < cooldown:
                             continue
 
-                    # Paper-trade the same validated signal universe. No exchange order is sent.
-                    if symbol in SIGNAL_DELIVERY_SYMBOLS:
+                    if symbol not in SIGNAL_DELIVERY_SYMBOLS:
+                        log.info("SHADOW SIGNAL | %s %s | excluded from delivery universe",
+                                 signal["side"], symbol)
+                        last_signal_sent[symbol] = {
+                            "side": signal["side"],
+                            "sent_at": now,
+                            "candle_id": signal["candle_id"],
+                        }
+                        continue
+
+                    # The virtual portfolio is independent of Telegram delivery.
+                    if paper_book.active():
                         opened = paper_book.open_trade(signal)
                         if opened:
                             log.info("PAPER STATUS | %s", paper_book.status())
 
-                    if symbol not in SIGNAL_DELIVERY_SYMBOLS:
-                        log.info("SHADOW ONLY %s %s; excluded by historical validation",
-                                 signal["side"], symbol)
-                        last_signal_sent[symbol] = {
-                            "side": signal["side"], "sent_at": now,
-                            "candle_id": signal["candle_id"],
-                        }
-                        continue
-
                     if not ENABLE_SIGNAL_DELIVERY:
-                        log.info("SHADOW SIGNAL %s %s confidence=%s; Telegram delivery disabled",
-                                 signal["side"], symbol, signal["confidence"])
-                        last_signal_sent[symbol] = {
-                            "side": signal["side"], "sent_at": now,
-                            "candle_id": signal["candle_id"],
-                        }
+                        log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s",
+                                 signal["side"], symbol)
                         continue
 
-                    sent = await telegram_send(session, format_signal(signal))
-                    if sent:
+                    delivered = await telegram_send(session, format_signal(signal))
+                    if delivered:
                         last_signal_sent[symbol] = {
-                            "side": signal["side"], "sent_at": now,
+                            "side": signal["side"],
+                            "sent_at": now,
                             "candle_id": signal["candle_id"],
                         }
-                        log.info("Delivered %s signal for %s, confidence=%s",
+                        log.info("SIGNAL DELIVERED | %s %s | confidence=%s",
                                  signal["side"], symbol, signal["confidence"])
                     else:
-                        log.warning("Signal %s %s was not delivered; it remains eligible for retry",
+                        log.warning("SIGNAL NOT DELIVERED | %s %s",
                                     signal["side"], symbol)
 
-        except Exception as exc:
-            log.exception("Binance signal feed disconnected (%s); retrying in 15 sec",
-                          type(exc).__name__)
-            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Binance signal stream disconnected; reconnecting in 10s")
+            await asyncio.sleep(10)
 
-
-async def telegram_send_http(text):
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        await telegram_send(session, text)
 
 async def main():
     if not BOT_TOKEN or not CHAT_ID:
-        log.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway variables.")
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in Railway variables.")
+
     timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(limit=30)
+    connector = aiohttp.TCPConnector(limit=40)
+
+    log.info("BOOT | strict Telegram allowlist enabled")
+    log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW")
+    log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
+    log.info("SIGNAL DELIVERY | enabled=%s | symbols=%s",
+             ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS))
+    log.info("PAPER TRADING | %s", paper_book.status())
+
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        symbols = await discover_trading_universe(session) if BINANCE_SYMBOLS else []
-        tasks = [binance_monitor(session)]
+        universe = await discover_trading_universe(session)
+        tasks = [binance_signal_monitor(session, universe)]
+
         if ENABLE_MARKET_INTEL:
-            tasks.append(run_market_intelligence(session, symbols))
-        log.info(
-            "Starting strict Telegram delivery: LONG/SHORT signals and large BUY/SELL executions only. "
-            "Price-only, funding, OI, SEC and RSS alerts are disabled."
-        )
-        log.info("Signal delivery=%s for %s; public trade tape=%s",
-                 ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS), ENABLE_MARKET_INTEL)
+            # The market-intel module runs public Hyperliquid executions and,
+            # when enabled, Binance order-book flow. Its send path uses our allowlist.
+            tasks.append(run_market_intelligence(session, universe))
+
+        if not ENABLE_ORDER_FLOW:
+            log.info("ORDER FLOW disabled by ENABLE_ORDER_FLOW=false")
+
         await asyncio.gather(*tasks)
 
 
