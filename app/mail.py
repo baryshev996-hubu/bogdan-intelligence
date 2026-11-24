@@ -278,62 +278,6 @@ async def discover_trading_universe(session):
         return sorted(pinned)
 
 
-async def market_intel_monitor(session, symbols):
-    """Public derivatives positioning alerts. These are context, never trade triggers."""
-    while True:
-        for symbol in symbols:
-            try:
-                paths = [
-                    ("/fapi/v1/openInterest", {"symbol": symbol}),
-                    ("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 1}),
-                    ("/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1}),
-                    ("/futures/data/takerlongshortRatio", {"symbol": symbol, "period": "5m", "limit": 1}),
-                ]
-                async def get(path, params):
-                    async with session.get("https://fapi.binance.com" + path, params=params, timeout=15) as resp:
-                        resp.raise_for_status()
-                        return await resp.json(content_type=None)
-                data = await asyncio.gather(*(get(path, params) for path, params in paths),
-                                            return_exceptions=True)
-                oi, funding, crowd, taker = data
-                funding = funding[0] if isinstance(funding, list) and funding else None
-                crowd = crowd[0] if isinstance(crowd, list) and crowd else None
-                taker = taker[0] if isinstance(taker, list) and taker else None
-                notes, score = [], 0
-                if funding:
-                    rate = float(funding.get("fundingRate", 0))
-                    if abs(rate) >= 0.0008:
-                        score += 1
-                        notes.append(f"Funding {rate * 100:.3f}%")
-                if crowd:
-                    ratio = float(crowd.get("longShortRatio", 1))
-                    if ratio >= 2.0 or ratio <= 0.5:
-                        score += 1
-                        notes.append(f"Global Long/Short {ratio:.2f}")
-                if taker:
-                    ratio = float(taker.get("buySellRatio", 1))
-                    if ratio >= 1.8 or ratio <= 0.56:
-                        score += 1
-                        notes.append(f"Taker buy/sell {ratio:.2f}")
-                if score < INTEL_MIN_ALERT_SCORE:
-                    continue
-                key = (symbol, "|".join(notes))
-                now = time.time()
-                if now - intel_last_alert.get(key, 0) < 3600:
-                    continue
-                oi_value = oi.get("openInterest", "n/a") if isinstance(oi, dict) else "n/a"
-                msg = (f"⚠️ BOGDAN INTELLIGENCE | DERIVATIVES INTEL\\n{symbol}\\n"
-                       + "\\n".join(f"• {note}" for note in notes)
-                       + f"\\nOpen Interest: {oi_value}"
-                       + "\\nПерекос позиционирования. Это предупреждение, не LONG/SHORT сигнал.")
-                if await telegram_send(session, msg):
-                    intel_last_alert[key] = now
-            except Exception:
-                log.exception("Derivatives intelligence error for %s", symbol)
-            await asyncio.sleep(0.15)
-        await asyncio.sleep(INTEL_POLL_SECONDS)
-
-
 async def binance_monitor(session):
     if not BINANCE_SYMBOLS:
         log.warning("No BINANCE_SYMBOLS configured; signal engine is idle.")
