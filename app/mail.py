@@ -35,7 +35,10 @@ ENABLE_SEC_ALERTS = os.getenv("ENABLE_SEC_ALERTS", "false").lower() == "true"
 ENABLE_RSS_ALERTS = os.getenv("ENABLE_RSS_ALERTS", "false").lower() == "true"
 SIGNAL_SAME_SIDE_COOLDOWN = int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600"))
 SIGNAL_FLIP_COOLDOWN = int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600"))
-ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "false").lower() == "true"
+ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
+SIGNAL_DELIVERY_SYMBOLS = {x.strip().upper() for x in os.getenv(
+    "SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,SOLUSDT,XRPUSDT"
+).split(",") if x.strip()}
 
 seen = set()
 last_prices = {}
@@ -312,6 +315,15 @@ async def binance_monitor(session):
                         if now - previous["sent_at"] < cooldown:
                             continue
 
+                    if symbol not in SIGNAL_DELIVERY_SYMBOLS:
+                        log.info("SHADOW ONLY %s %s; excluded by historical validation",
+                                 signal["side"], symbol)
+                        last_signal_sent[symbol] = {
+                            "side": signal["side"], "sent_at": now,
+                            "candle_id": signal["candle_id"],
+                        }
+                        continue
+
                     if not ENABLE_SIGNAL_DELIVERY:
                         log.info("SHADOW SIGNAL %s %s confidence=%s; Telegram delivery disabled",
                                  signal["side"], symbol, signal["confidence"])
@@ -355,8 +367,9 @@ async def main():
             tasks.append(sec_monitor(session))
         if ENABLE_RSS_ALERTS and RSS_FEEDS:
             tasks.append(rss_monitor(session))
-        log.info("Starting signal engine. Signal delivery=%s, SEC alerts=%s, RSS alerts=%s",
-                 ENABLE_SIGNAL_DELIVERY, ENABLE_SEC_ALERTS, ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
+        log.info("Starting signal engine. Signal delivery=%s for %s; SEC alerts=%s, RSS alerts=%s",
+                 ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS), ENABLE_SEC_ALERTS,
+                 ENABLE_RSS_ALERTS and bool(RSS_FEEDS))
         await asyncio.gather(*tasks)
 
 
