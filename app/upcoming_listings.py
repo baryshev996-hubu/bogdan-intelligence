@@ -126,7 +126,7 @@ async def _binance_listing_page(session):
 
     found = {}
     href_pattern = re.compile(
-        r"""href=["'](?P<href>[^"']*/support/announcement/detail/(?P<code>[a-f0-9]{32})[^"']*)["']""",
+        r"""href=["'](?P<href>[^"']*/support/announcement/(?:detail/)?(?P<code>[a-f0-9]{32})[^"']*)["']""",
         re.I,
     )
     for match in href_pattern.finditer(page):
@@ -140,7 +140,7 @@ async def _binance_listing_page(session):
             found[code] = {
                 "code": code,
                 "title": title,
-                "url": "https://www.binance.com/en/support/announcement/detail/" + code,
+                "url": "https://www.binance.com/en/support/announcement/" + code,
             }
 
     # Next.js payload fallback: article code/title may be embedded without an anchor.
@@ -159,12 +159,22 @@ async def _binance_listing_page(session):
 
 
 async def _binance_listings(session):
-    url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
+    url = "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
     articles = []
     try:
-        data = await _json_get(
-            session, url, {"type": 1, "pageNo": 1, "pageSize": 20, "category": 48}
-        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en",
+            "Referer": "https://www.binance.com/en/messages/v2/group/announcement",
+            "lang": "en",
+        }
+        async with session.get(
+            url, params={"type": 1, "pageNo": 1, "pageSize": 30, "catalogId": 48},
+            headers=headers, timeout=18
+        ) as response:
+            response.raise_for_status()
+            data = await response.json(content_type=None)
         result = data.get("data") or {}
         catalogs = result.get("catalogs") or []
         for catalog in catalogs:
@@ -184,7 +194,7 @@ async def _binance_listings(session):
         if not code:
             continue
         detail_url = item.get("url") or (
-            "https://www.binance.com/en/support/announcement/detail/" + code
+            "https://www.binance.com/en/support/announcement/" + code
         )
         detail_text = ""
         try:
