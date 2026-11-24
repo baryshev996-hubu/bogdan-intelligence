@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
 from app.market_intel import run_market_intelligence
+from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
 
 # Separate short sprint. 09:00 Kyiv time on 25 Nov 2026 = 07:00 UTC.
@@ -55,6 +56,7 @@ SIGNAL_DELIVERY_SYMBOLS = {
 ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
 ENABLE_MARKET_INTEL = os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true"
 ENABLE_ORDER_FLOW = os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true"
+ENABLE_ARKHAM = os.getenv("ENABLE_ARKHAM", "true").lower() == "true"
 AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
 MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "12"))))
 SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600")))
@@ -88,6 +90,9 @@ def is_allowed_telegram_alert(message: str) -> bool:
         )
 
     if normalized.startswith("ORDER FLOW INTELLIGENCE |"):
+        return True
+
+    if normalized.startswith("ARKHAM WHALE INTELLIGENCE |"):
         return True
 
     return False
@@ -381,7 +386,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=40)
 
     log.info("BOOT | strict Telegram allowlist enabled")
-    log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW")
+    log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, ARKHAM WHALE INTELLIGENCE")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
     log.info("SIGNAL DELIVERY | enabled=%s | symbols=%s",
              ENABLE_SIGNAL_DELIVERY, sorted(SIGNAL_DELIVERY_SYMBOLS))
@@ -393,9 +398,12 @@ async def main():
         tasks = [binance_signal_monitor(session, universe)]
 
         if ENABLE_MARKET_INTEL:
-            # The market-intel module runs public Hyperliquid executions and,
-            # when enabled, Binance order-book flow. Its send path uses our allowlist.
+            # Public Hyperliquid executions and Binance order-book flow.
             tasks.append(run_market_intelligence(session, universe))
+
+        if ENABLE_ARKHAM:
+            # Optional Arkham API monitor. It stays idle until an API key is configured.
+            tasks.append(run_arkham_monitor(session))
 
         if not ENABLE_ORDER_FLOW:
             log.info("ORDER FLOW disabled by ENABLE_ORDER_FLOW=false")
