@@ -3,6 +3,7 @@ import asyncio
 import bisect
 import logging
 import os
+import time
 from collections import defaultdict
 
 import aiohttp
@@ -30,7 +31,7 @@ async def fetch_candles(session, symbol, interval):
         rows = await response.json(content_type=None)
 
     candles = []
-    now_ms = int(__import__("time").time() * 1000)
+    now_ms = int(time.time() * 1000)
     for row in rows:
         if int(row[6]) >= now_ms:
             continue
