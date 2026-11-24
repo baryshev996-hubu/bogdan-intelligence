@@ -103,13 +103,15 @@ async def hyperliquid_whale_monitor(session, coins=None):
                             users = trade.get("users") or []
                             parties = ", ".join(str(x)[:10] for x in users[:2]) or "н/д"
                             side_text = "BUY" if side == "B" else "SELL" if side == "A" else side
+                            side_icon = "🟢" if side_text == "BUY" else "🔴" if side_text == "SELL" else "⚪"
                             await send(session,
-                                "🐳 LARGE EXECUTION | Hyperliquid | " + coin + "\n"
-                                + "Taker: " + side_text + "\nЦена: " + str(price) + "\n"
-                                + "Размер: " + str(size) + " " + coin + "\n"
+                                "🐳 LARGE EXECUTION | HYPERLIQUID | " + coin + "\n"
+                                + "Taker: " + side_text + " " + side_icon + "\n"
+                                + "Цена: $" + format(price, ",.4f").rstrip("0").rstrip(".") + "\n"
+                                + "Размер: " + format(size, ",.4f").rstrip("0").rstrip(".") + " " + coin + "\n"
                                 + "Номинал: $" + format(usd, ",.0f") + "\n"
                                 + "Обрезанные адреса участников: " + parties + "\n"
-                                + "Публичная крупная сделка. Это не доказательство инсайда и не сигнал копировать.")
+                                + "Источник: публичная лента Hyperliquid.")
                         except (TypeError, ValueError):
                             log.debug("Malformed Hyperliquid trade: %r", trade)
         except asyncio.CancelledError:
