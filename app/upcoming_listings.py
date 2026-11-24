@@ -111,26 +111,81 @@ async def _json_get(session, url, params=None):
         return await response.json(content_type=None)
 
 
+async def _binance_listing_page(session):
+    """Fallback to Binance's official announcement page when its CMS API rejects requests."""
+    page_url = "https://www.binance.com/en/support/announcement/list/48"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.binance.com/en/support/announcement",
+    }
+    async with session.get(page_url, headers=headers, timeout=20) as response:
+        response.raise_for_status()
+        page = await response.text(errors="ignore")
+
+    found = {}
+    href_pattern = re.compile(
+        r'href=["\\'](?P<href>[^"\\']*/support/announcement/detail/(?P<code>[a-f0-9]{32})[^"\\']*)["\\']',
+        re.I,
+    )
+    for match in href_pattern.finditer(page):
+        code = match.group("code")
+        left = page.rfind("<a", 0, match.start())
+        right = page.find("</a>", match.end())
+        if left < 0 or right < 0:
+            continue
+        title = _clean(page[left:right + 4])
+        if title:
+            found[code] = {
+                "code": code,
+                "title": title,
+                "url": "https://www.binance.com/en/support/announcement/detail/" + code,
+            }
+
+    # Next.js payload fallback: article code/title may be embedded without an anchor.
+    if not found:
+        code_matches = re.findall(r'"code"\\s*:\\s*"([a-f0-9]{32})"', page, re.I)
+        title_matches = re.findall(r'"title"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"', page)
+        for code, title in zip(code_matches, title_matches):
+            clean_title = _clean(title.encode("utf-8").decode("unicode_escape"))
+            if clean_title:
+                found[code] = {
+                    "code": code,
+                    "title": clean_title,
+                    "url": "https://www.binance.com/en/support/announcement/detail/" + code,
+                }
+    return list(found.values())
+
+
 async def _binance_listings(session):
     url = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query"
-    # Binance's current CMS API expects category, not the obsolete catalogId.
-    data = await _json_get(
-        session, url, {"type": 1, "pageNo": 1, "pageSize": 20, "category": 48}
-    )
-    result = data.get("data") or {}
-    catalogs = result.get("catalogs") or []
     articles = []
-    for catalog in catalogs:
-        articles.extend(catalog.get("articles") or [])
-    # Some response variants expose articles directly.
-    articles.extend(result.get("articles") or [])
+    try:
+        data = await _json_get(
+            session, url, {"type": 1, "pageNo": 1, "pageSize": 20, "category": 48}
+        )
+        result = data.get("data") or {}
+        catalogs = result.get("catalogs") or []
+        for catalog in catalogs:
+            articles.extend(catalog.get("articles") or [])
+        articles.extend(result.get("articles") or [])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("Binance CMS API unavailable; trying official announcement HTML: %s",
+                    str(exc)[:180])
+        articles = await _binance_listing_page(session)
+
     out = []
     for item in articles:
         title = _clean(item.get("title"))
         code = str(item.get("code") or item.get("id") or "")
         if not code:
             continue
-        detail_url = "https://www.binance.com/en/support/announcement/" + code
+        detail_url = item.get("url") or (
+            "https://www.binance.com/en/support/announcement/detail/" + code
+        )
         detail_text = ""
         try:
             detail = await _json_get(
@@ -140,25 +195,38 @@ async def _binance_listings(session):
             )
             article = (detail.get("data") or {}).get("article") or {}
             detail_text = _clean(article.get("body") or article.get("content") or "")
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            log.debug("Binance detail API unavailable for %s", code)
+            log.debug("Binance detail API unavailable for %s; trying article page", code)
         if not detail_text:
             try:
-                async with session.get(detail_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12) as response:
+                async with session.get(
+                    detail_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; BOGDAN-INTELLIGENCE/1.0)"},
+                    timeout=15,
+                ) as response:
                     if response.status == 200:
                         detail_text = _clean(await response.text())
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 log.debug("Binance detail page fetch failed for %s", code)
+
         market_type = _market_type(title, detail_text)
         when = _parse_explicit_utc(detail_text) or _parse_explicit_utc(title)
         if when and market_type:
             out.append({
-                "id": "binance:" + code, "exchange": "Binance", "title": title,
-                "market_type": market_type, "ticker": _extract_ticker(title + " " + detail_text), "when": when,
-                "url": detail_url, "source": "Binance official announcement",
+                "id": "binance:" + code,
+                "exchange": "Binance",
+                "title": title,
+                "market_type": market_type,
+                "ticker": _extract_ticker(title + " " + detail_text),
+                "when": when,
+                "url": detail_url,
+                "source": "Binance official announcement",
             })
     return out
-
 
 async def _bybit_listings(session):
     data = await _json_get(
