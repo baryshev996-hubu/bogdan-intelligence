@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
 from app.market_intel import run_market_intelligence
+from app.paper_trader import paper_book
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
@@ -355,6 +356,10 @@ async def binance_monitor(session):
                     }
                     store_closed_candle(histories[symbol][interval], candle)
 
+                    # Update virtual positions only on fully closed 5m candles.
+                    if interval == "5m":
+                        paper_book.on_candle(symbol, candle)
+
                     # A new setup is checked only when a 5m candle has closed.
                     if interval != "5m":
                         continue
@@ -362,6 +367,12 @@ async def binance_monitor(session):
                     signal = evaluate(symbol, histories[symbol])
                     if not signal:
                         continue
+
+                    # Paper-trade the same validated signal universe. No exchange order is sent.
+                    if symbol in SIGNAL_DELIVERY_SYMBOLS:
+                        opened = paper_book.open_trade(signal)
+                        if opened:
+                            log.info("PAPER STATUS | %s", paper_book.status())
 
                     now = time.time()
                     previous = last_signal_sent.get(symbol)
