@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import json
 import logging
@@ -202,7 +203,7 @@ async def rss_monitor(session):
         await asyncio.sleep(max(POLL_SECONDS, 60))
 
 async def load_binance_history(session, symbol, interval):
-    url = "https://data-api.binance.vision/api/v3/klines"
+    url = "https://fapi.binance.com/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": 200}
     async with session.get(url, params=params, timeout=20) as resp:
         if resp.status == 451:
@@ -261,7 +262,7 @@ async def binance_monitor(session):
         f"{symbol.lower()}@kline_{interval}"
         for symbol in symbols for interval in INTERVALS
     )
-    url = f"wss://data-stream.binance.vision:443/stream?streams={streams}"
+    url = f"wss://fstream.binance.com/market/stream?streams={streams}"
 
     while True:
         try:
@@ -269,7 +270,7 @@ async def binance_monitor(session):
                 url, ping_interval=20, ping_timeout=60,
                 close_timeout=10, open_timeout=20, max_size=2**20
             ) as ws:
-                log.info("Connected to Binance public market-data streams: %s", symbols)
+                log.info("Connected to Binance USD-M Futures market streams: %s", symbols)
                 async for raw in ws:
                     packet = json.loads(raw)
                     item = packet.get("data", {})
