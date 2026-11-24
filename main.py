@@ -39,7 +39,23 @@ def utc_now():
 def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
+def is_allowed_telegram_alert(message):
+    normalized = message.strip().upper()
+    return (
+        "BOGDAN INTELLIGENCE | LONG" in normalized
+        or "BOGDAN INTELLIGENCE | SHORT" in normalized
+        or (
+            "LARGE EXECUTION | HYPERLIQUID |" in normalized
+            and any(line.strip().startswith(("TAKER: BUY", "TAKER: SELL"))
+                    for line in normalized.splitlines())
+        )
+    )
+
 async def telegram_send(session, text):
+    # Legacy entrypoint safety net. Block all price-move, SEC and RSS alerts.
+    if not is_allowed_telegram_alert(text):
+        log.info("Telegram alert suppressed by strict BUY/SELL/LONG/SHORT filter")
+        return False
     if not BOT_TOKEN or not CHAT_ID:
         log.warning("Telegram not configured. Alert was not sent:\n%s", text)
         return
