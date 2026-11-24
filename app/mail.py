@@ -33,6 +33,9 @@ last_prices = {}
 last_sec_check = {}
 ticker_to_cik = {}
 
+telegram_send_lock = asyncio.Lock()
+telegram_last_sent = 0.0
+
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -40,18 +43,59 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
 
 async def telegram_send(session, text):
+    global telegram_last_sent
     if not BOT_TOKEN or not CHAT_ID:
         log.warning("Telegram not configured. Alert was not sent:\n%s", text)
         return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        async with session.post(url, json=payload, timeout=15) as resp:
-            body = await resp.json()
-            if resp.status != 200 or not body.get("ok"):
-                log.error("Telegram API error: %s", body)
-    except Exception:
-        log.exception("Telegram delivery failed")
+
+    # Serialize all senders and respect Telegram's practical per-chat rate limit.
+    async with telegram_send_lock:
+        for attempt in range(4):
+            wait_for = 1.1 - (time.monotonic() - telegram_last_sent)
+            if wait_for > 0:
+                await asyncio.sleep(wait_for)
+
+            try:
+                async with session.post(url, json=payload, timeout=20) as resp:
+                    telegram_last_sent = time.monotonic()
+                    body = await resp.json(content_type=None)
+
+                    if resp.status == 200 and body.get("ok"):
+                        return
+
+                    if resp.status == 429:
+                        retry_after = body.get("parameters", {}).get("retry_after", 2)
+                        try:
+                            retry_after = max(1, min(int(retry_after), 60))
+                        except (TypeError, ValueError):
+                            retry_after = 2
+                        log.warning("Telegram rate limited; retrying after %s seconds", retry_after)
+                        if attempt < 3:
+                            await asyncio.sleep(retry_after)
+                            continue
+
+                    if resp.status >= 500 and attempt < 3:
+                        delay = min(2 ** attempt, 15)
+                        log.warning("Telegram server error %s; retrying in %s seconds", resp.status, delay)
+                        await asyncio.sleep(delay)
+                        continue
+
+                    log.error("Telegram API error (HTTP %s): %s", resp.status, body)
+                    return
+
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if attempt == 3:
+                    log.exception("Telegram delivery failed after retries")
+                    return
+                delay = min(2 ** attempt, 15)
+                log.warning("Telegram network error; retrying in %s seconds", delay, exc_info=True)
+                await asyncio.sleep(delay)
+            except Exception:
+                log.exception("Unexpected Telegram delivery error")
+                return
 
 async def load_ticker_map(session):
     url = "https://www.sec.gov/files/company_tickers.json"
