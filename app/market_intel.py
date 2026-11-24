@@ -10,7 +10,10 @@ import websockets
 log = logging.getLogger("bogdan-intel.market")
 SYMBOLS = [s.strip().upper() for s in os.getenv("BINANCE_SYMBOLS", "btcusdt,ethusdt,solusdt,xrpusdt").split(",") if s.strip()]
 COINS = [s.strip().upper() for s in os.getenv("HYPERLIQUID_COINS", "BTC,ETH,SOL,XRP").split(",") if s.strip()]
-WHALE_USD = float(os.getenv("WHALE_TRADE_USD", "250000"))
+WHALE_USD = float(os.getenv("WHALE_TRADE_USD", "500000"))
+WHALE_WINDOW_SECONDS = max(10, int(os.getenv("WHALE_FLOW_WINDOW_SECONDS", "30")))
+WHALE_COOLDOWN = max(60, int(os.getenv("WHALE_FLOW_COOLDOWN_SECONDS", "180")))
+ORDER_FLOW_DEFAULT = "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,LINKUSDT,TRXUSDT,SUIUSDT,AVAXUSDT,1000PEPEUSDT"
 OI_MOVE_PCT = float(os.getenv("OI_MOVE_ALERT_PCT", "1.5"))
 COOLDOWN = int(os.getenv("INTEL_ALERT_COOLDOWN", "900"))
 
@@ -70,17 +73,26 @@ async def derivatives_monitor(session, symbols=None):
         await asyncio.sleep(60)
 
 async def hyperliquid_whale_monitor(session, coins=None):
-    watch_coins = [s.upper() for s in coins] if coins else COINS
+    """Aggregate large public taker flow to avoid one Telegram alert per print."""
+    watch_coins = [s.upper() for s in (coins if coins is not None else COINS)]
     if not watch_coins:
         return
-    gate = Gate()
     url = "wss://api.hyperliquid.xyz/ws"
     while True:
+        flow = defaultdict(lambda: deque())
+        last_alert = {}
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=60, close_timeout=10, open_timeout=20) as ws:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=60,
+                close_timeout=10, open_timeout=20, max_size=2**20
+            ) as ws:
                 for coin in watch_coins:
-                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
-                log.info("Hyperliquid public trade tape connected: %s", watch_coins)
+                    await ws.send(json.dumps({
+                        "method": "subscribe",
+                        "subscription": {"type": "trades", "coin": coin}
+                    }))
+                log.info("HYPERLIQUID FLOW CONNECTED | coins=%s | aggregate_window=%ss | threshold=$%s",
+                         watch_coins, WHALE_WINDOW_SECONDS, int(WHALE_USD))
                 async for raw in ws:
                     packet = json.loads(raw)
                     if packet.get("channel") != "trades":
@@ -88,36 +100,44 @@ async def hyperliquid_whale_monitor(session, coins=None):
                     trades = packet.get("data", [])
                     if isinstance(trades, dict):
                         trades = [trades]
+                    now = time.time()
                     for trade in trades:
                         try:
-                            coin = str(trade.get("coin", ""))
-                            side = str(trade.get("side", "?"))
+                            coin = str(trade.get("coin", "")).upper()
+                            side = "BUY" if trade.get("side") == "B" else "SELL" if trade.get("side") == "A" else ""
                             price = float(trade.get("px", 0))
                             size = float(trade.get("sz", 0))
                             usd = price * size
-                            if usd < WHALE_USD:
+                            if coin not in watch_coins or not side or price <= 0 or usd < 25000:
                                 continue
-                            key = "trade:" + str(trade.get("hash")) + ":" + coin + ":" + side
-                            if not gate.allow(key):
+                            key = (coin, side)
+                            bucket = flow[key]
+                            bucket.append((now, usd, price))
+                            while bucket and now - bucket[0][0] > WHALE_WINDOW_SECONDS:
+                                bucket.popleft()
+                            total = sum(row[1] for row in bucket)
+                            if total < WHALE_USD or now - last_alert.get(key, 0) < WHALE_COOLDOWN:
                                 continue
-                            users = trade.get("users") or []
-                            parties = ", ".join(str(x)[:10] for x in users[:2]) or "н/д"
-                            side_text = "BUY" if side == "B" else "SELL" if side == "A" else side
-                            side_icon = "🟢" if side_text == "BUY" else "🔴" if side_text == "SELL" else "⚪"
+                            largest = max(row[1] for row in bucket)
+                            avg_price = sum(row[1] * row[2] for row in bucket) / max(total, 1)
+                            last_alert[key] = now
                             await send(session,
-                                "🐳 LARGE EXECUTION | HYPERLIQUID | " + coin + "\n"
-                                + "Taker: " + side_text + " " + side_icon + "\n"
-                                + "Цена: $" + format(price, ",.4f").rstrip("0").rstrip(".") + "\n"
-                                + "Размер: " + format(size, ",.4f").rstrip("0").rstrip(".") + " " + coin + "\n"
-                                + "Номинал: $" + format(usd, ",.0f") + "\n"
-                                + "Обрезанные адреса участников: " + parties + "\n"
-                                + "Источник: публичная лента Hyperliquid.")
+                                "🐳 LARGE EXECUTION | HYPERLIQUID | " + coin + "\\n"
+                                + "Taker: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\\n"
+                                + "Агрегированный поток: $" + format(total, ",.0f") + "\\n"
+                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\\n"
+                                + "Средневзвешенная цена: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\\n"
+                                + "Окно: " + str(WHALE_WINDOW_SECONDS) + " сек. | сделок: " + str(len(bucket)) + "\\n"
+                                + "Источник: публичная лента Hyperliquid. Это поток агрессивных сделок, не подтверждение личности или намерений участника."
+                            )
+                            log.info("HYPERLIQUID FLOW ALERT | %s %s | usd=%.0f | prints=%d",
+                                     coin, side, total, len(bucket))
                         except (TypeError, ValueError):
                             log.debug("Malformed Hyperliquid trade: %r", trade)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("Hyperliquid stream disconnected; reconnecting")
+            log.exception("Hyperliquid stream disconnected; reconnecting in 10s")
             await asyncio.sleep(10)
 
 async def run_market_intelligence(session, symbols=None):
@@ -125,5 +145,10 @@ async def run_market_intelligence(session, symbols=None):
     from app.order_flow import run_order_flow_monitor
     tasks = [hyperliquid_whale_monitor(session, COINS)]
     if os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true":
-        tasks.append(run_order_flow_monitor(session, symbols or SYMBOLS))
+        requested = [s.strip().upper() for s in os.getenv("ORDER_FLOW_SYMBOLS", ORDER_FLOW_DEFAULT).split(",") if s.strip()]
+        available = set(symbols or SYMBOLS)
+        order_flow_symbols = [s for s in requested if s in available]
+        if not order_flow_symbols:
+            order_flow_symbols = (symbols or SYMBOLS)[:12]
+        tasks.append(run_order_flow_monitor(session, order_flow_symbols))
     await asyncio.gather(*tasks)
