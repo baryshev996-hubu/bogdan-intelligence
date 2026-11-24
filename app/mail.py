@@ -72,7 +72,7 @@ def is_allowed_telegram_alert(message):
     )
     large_execution = (
         "LARGE EXECUTION | HYPERLIQUID |" in normalized
-        and any(line.strip() in {"TAKER: BUY", "TAKER: SELL"} for line in normalized.splitlines())
+        and any(line.strip().startswith(("TAKER: BUY", "TAKER: SELL")) for line in normalized.splitlines())
     )
     return signal or large_execution
 
