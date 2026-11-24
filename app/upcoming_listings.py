@@ -114,11 +114,22 @@ async def _binance_listings(session):
         detail_url = "https://www.binance.com/en/support/announcement/detail/" + code
         detail_text = ""
         try:
-            async with session.get(detail_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12) as response:
-                if response.status == 200:
-                    detail_text = _clean(await response.text())
+            detail = await _json_get(
+                session,
+                "https://www.binance.com/bapi/composite/v1/public/cms/article/detail/query",
+                {"articleCode": code},
+            )
+            article = (detail.get("data") or {}).get("article") or {}
+            detail_text = _clean(article.get("body") or article.get("content") or "")
         except Exception:
-            log.debug("Binance detail fetch failed for %s", code)
+            log.debug("Binance detail API unavailable for %s", code)
+        if not detail_text:
+            try:
+                async with session.get(detail_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12) as response:
+                    if response.status == 200:
+                        detail_text = _clean(await response.text())
+            except Exception:
+                log.debug("Binance detail page fetch failed for %s", code)
         when = _parse_explicit_utc(detail_text) or _parse_explicit_utc(title)
         if when:
             out.append({
