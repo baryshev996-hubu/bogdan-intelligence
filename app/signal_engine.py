@@ -33,7 +33,9 @@ def rsi(values, period=14):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
-        return 100.0
+        return 50.0 if avg_gain == 0 else 100.0
+    if avg_gain == 0:
+        return 0.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
@@ -99,14 +101,14 @@ def _fmt_price(value):
     return f"{value:.6f}"
 
 
-def evaluate(symbol, candles_by_interval):
+def evaluate(symbol, candles_by_interval, as_of_ms=None):
     """Return a signal dict only when strict conditions align."""
     candles = {tf: list(candles_by_interval.get(tf, ())) for tf in INTERVALS}
     if any(len(candles[tf]) < 60 for tf in INTERVALS):
         return None
 
     c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = as_of_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     freshness_limits = {"5m": 12 * 60 * 1000, "15m": 35 * 60 * 1000, "1h": 2 * 60 * 60 * 1000}
     for timeframe, limit_ms in freshness_limits.items():
         latest = candles[timeframe][-1].get("close_time", 0)
@@ -171,8 +173,7 @@ def evaluate(symbol, candles_by_interval):
 
     targets = ([price + risk * n for n in (1, 2, 3)] if side == "LONG"
                else [price - risk * n for n in (1, 2, 3)])
-    confidence = 70
-    confidence += 5 if trend15 == trend1h else 0
+    confidence = 65
     confidence += 5 if volume_ratio >= 1.5 else 0
     confidence += 5 if body_ratio >= 0.7 else 0
     confidence += 5 if 52 <= rsi5 <= 63 and side == "LONG" else 0
@@ -203,6 +204,7 @@ def evaluate(symbol, candles_by_interval):
         "targets": targets,
         "confidence": confidence,
         "risk_pct": risk / price * 100,
+        "entry_zone": [price - 0.15 * atr5, price + 0.15 * atr5],
         "reasons": reasons,
         "candle_time": candle_label,
         "candle_id": last.get("open_time"),
@@ -218,6 +220,7 @@ def format_signal(signal):
         "",
         f"Актив: {signal['symbol']}",
         f"Вход: {_fmt_price(signal['entry'])}",
+        f"Рабочая зона: {_fmt_price(signal['entry_zone'][0])} – {_fmt_price(signal['entry_zone'][1])}",
         f"Stop Loss: {_fmt_price(signal['stop'])}",
         f"Take Profit 1: {_fmt_price(targets[0])}  (1R)",
         f"Take Profit 2: {_fmt_price(targets[1])}  (2R)",
@@ -232,6 +235,7 @@ def format_signal(signal):
     lines.extend([
         "",
         f"Свеча закрылась: {signal['candle_time']}",
+        "Не догонять цену за пределами рабочей зоны",
         "Рынок: Binance USDⓈ-M Futures",
         "Режим: наблюдение, без открытия сделок",
     ])
