@@ -403,8 +403,6 @@ async def main():
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         symbols = await discover_trading_universe(session) if BINANCE_SYMBOLS else []
         tasks = [binance_monitor(session)]
-        if os.getenv("ENABLE_MARKET_INTEL", "true").lower() == "true" and symbols:
-            tasks.append(market_intel_monitor(session, symbols))
         if ENABLE_MARKET_INTEL:
             tasks.append(run_market_intelligence(session, symbols))
         if ENABLE_SEC_ALERTS:
