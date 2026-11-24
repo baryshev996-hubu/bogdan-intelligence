@@ -106,6 +106,12 @@ def evaluate(symbol, candles_by_interval):
         return None
 
     c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    freshness_limits = {"5m": 12 * 60 * 1000, "15m": 35 * 60 * 1000, "1h": 2 * 60 * 60 * 1000}
+    for timeframe, limit_ms in freshness_limits.items():
+        latest = candles[timeframe][-1].get("close_time", 0)
+        if not latest or now_ms - latest > limit_ms:
+            return None
     closes5 = [c["close"] for c in c5]
     last = c5[-1]
     price = last["close"]
@@ -226,7 +232,7 @@ def format_signal(signal):
     lines.extend([
         "",
         f"Свеча закрылась: {signal['candle_time']}",
-        "Рынок: Binance Spot",
+        "Рынок: Binance USDⓈ-M Futures",
         "Режим: наблюдение, без открытия сделок",
     ])
     return "\n".join(lines)
