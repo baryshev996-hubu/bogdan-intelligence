@@ -225,6 +225,9 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, diagnostics=None):
 
 
 
+SIGNAL_ALERT_SUFFIX = " ‼️🚨‼️ 🚨‼️ 🚨‼️ 🚨‼️"
+
+
 def format_signal(signal):
     """Render a Telegram HTML card, preserving the allowlisted plain header."""
     side = signal["side"]
@@ -252,7 +255,7 @@ def format_signal(signal):
         return "<code>" + escape(_fmt_price(value)) + "</code>"
 
     lines = [
-        f"{icon} BOGDAN INTELLIGENCE | {side}",
+        f"{icon} BOGDAN INTELLIGENCE | {side}{SIGNAL_ALERT_SUFFIX}",
         "",
         f"<b>{escape(pair)} · {side} {arrow}</b>",
         f"<i>BINANCE FUTURES | {escape(time_label)}</i>",

@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 if __name__ == "__main__":
     sys.modules["app.mail"] = sys.modules[__name__]
 
-from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, evaluate, format_signal
+from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, SIGNAL_ALERT_SUFFIX, evaluate, format_signal
 from app.analyst import market_context
 from app.leverage import build_leverage_paper_signal
 from app.signal_delivery import queue_signal, deliver_signals
@@ -223,11 +223,10 @@ def is_allowed_telegram_alert(message: str) -> bool:
     # Remove only the decorative icons used by our own formatters.
     normalized = header.lstrip("🟢🔴🐳🧭⚡️🔥🚨 ")
 
-    if normalized in {
+    if normalized.removesuffix(SIGNAL_ALERT_SUFFIX) in {
         "BOGDAN INTELLIGENCE | LONG",
         "BOGDAN INTELLIGENCE | SHORT",
-        "BOGDAN INTELLIGENCE | SYSTEM STATUS",
-    }:
+    } or normalized == "BOGDAN INTELLIGENCE | SYSTEM STATUS":
         return True
 
     if normalized.startswith("LARGE EXECUTION | HYPERLIQUID |"):
@@ -304,7 +303,7 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
             }
             # New signal, whale and order-flow cards only; other alerts remain plaintext.
             header = message.splitlines()[0] if message else ""
-            is_signal_card = header in {"🟢 BOGDAN INTELLIGENCE | LONG", "🔴 BOGDAN INTELLIGENCE | SHORT"}
+            is_signal_card = header.removesuffix(SIGNAL_ALERT_SUFFIX) in {"🟢 BOGDAN INTELLIGENCE | LONG", "🔴 BOGDAN INTELLIGENCE | SHORT"}
             is_whale_card = header.startswith((
                 "🐳 BOGDAN INTELLIGENCE | 🟢 FLOW CONFIRMED | ",
                 "🐳 BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION | ",
