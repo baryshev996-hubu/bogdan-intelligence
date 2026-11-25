@@ -155,7 +155,7 @@ def _fmt_price(value):
     return f"{value:.6f}"
 
 
-def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=True):
+def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=False):
     """Return a signal dict only when strict conditions align."""
     candles = {tf: list(candles_by_interval.get(tf, ())) for tf in INTERVALS}
     required = ("5m", "15m", "1h")
