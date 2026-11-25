@@ -186,6 +186,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
     if normalized in {
         "BOGDAN INTELLIGENCE | LONG",
         "BOGDAN INTELLIGENCE | SHORT",
+        "BOGDAN INTELLIGENCE | SYSTEM STATUS",
     }:
         return True
 
@@ -557,7 +558,7 @@ async def binance_signal_monitor(session, symbols):
             scan_signals += 1
             await dispatch_signal(signal)
 
-        if now_mono - last_scan_report >= 300:
+        if now_mono - last_scan_report >= 60:
             top_rejections = scan_rejections.most_common(6)
             log.info(
                 "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
@@ -665,7 +666,20 @@ async def main():
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        await validate_telegram_auth(session)
+        auth_ok = await validate_telegram_auth(session)
+        if auth_ok:
+            startup_message = (
+                "🟢 BOGDAN INTELLIGENCE | SYSTEM STATUS\n\n"
+                "Telegram: подключение подтверждено.\n"
+                "Binance Futures: сканер запускается.\n"
+                "Рынок: 100 USDT-M perpetual пар, закрытые свечи 5m / 15m / 1h.\n"
+                "Сигналы LONG / SHORT: включены.\n"
+                "Автоматические сделки: выключены."
+            )
+            startup_sent = await telegram_send(session, startup_message)
+            log.info("TELEGRAM STARTUP CHECK | delivered=%s", startup_sent)
+        else:
+            log.error("TELEGRAM STARTUP CHECK SKIPPED | authentication failed")
         universe = await discover_trading_universe(session)
         tasks = [
             binance_signal_monitor(session, universe),
