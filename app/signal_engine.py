@@ -278,6 +278,44 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=T
     }
 
 
+
+def confirm_signal_with_1m(signal, candle):
+    """Confirm a 5m setup with the first fully closed 1m candle after the signal."""
+    entry = float(signal["entry"])
+    open_price = float(candle["open"])
+    close_price = float(candle["close"])
+    candle_range = max(float(candle["high"]) - float(candle["low"]), close_price * 1e-9)
+    body_ratio = abs(close_price - open_price) / candle_range
+    risk = abs(entry - float(signal["stop"]))
+    if risk <= 0 or body_ratio < 0.25:
+        return None
+
+    delta = close_price - entry
+    if abs(delta) > 0.25 * risk:
+        return None
+
+    if signal["side"] == "SHORT":
+        confirmed = close_price < open_price and close_price <= entry
+        direction_text = "медвежья 1m свеча подтвердила SHORT"
+    else:
+        confirmed = close_price > open_price and close_price >= entry
+        direction_text = "бычья 1m свеча подтвердила LONG"
+    if not confirmed:
+        return None
+
+    adjusted = dict(signal)
+    adjusted["entry"] = close_price
+    adjusted["stop"] = float(signal["stop"]) + delta
+    adjusted["targets"] = [float(target) + delta for target in signal["targets"]]
+    adjusted["entry_zone"] = [float(level) + delta for level in signal["entry_zone"]]
+    adjusted["risk_pct"] = abs(adjusted["entry"] - adjusted["stop"]) / adjusted["entry"] * 100
+    adjusted["candle_time"] = datetime.fromtimestamp(
+        int(candle["close_time"]) / 1000, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    adjusted["reasons"] = list(signal.get("reasons", [])) + [direction_text]
+    return adjusted
+
+
 def format_signal(signal):
     side = signal["side"]
     icon = "🟢" if side == "LONG" else "🔴"
