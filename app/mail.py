@@ -16,7 +16,7 @@ import aiohttp
 import websockets
 from dotenv import load_dotenv
 
-from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal, confirm_signal_with_1m_window
+from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
@@ -351,9 +351,8 @@ async def binance_signal_monitor(session, symbols):
         symbol: {timeframe: deque(maxlen=MAX_CANDLES) for timeframe in INTERVALS}
         for symbol in symbols
     }
-    pending_signals = {}
 
-    async def dispatch_confirmed_signal(signal):
+    async def dispatch_signal(signal):
         symbol = signal["symbol"]
         now = time.time()
         previous = last_signal_sent.get(symbol)
@@ -366,6 +365,16 @@ async def binance_signal_monitor(session, symbols):
             if now - previous["sent_at"] < cooldown:
                 log.info("SIGNAL COOLDOWN | %s %s", signal["side"], symbol)
                 return
+
+        if symbol not in SIGNAL_DELIVERY_SYMBOLS:
+            log.info("SHADOW SIGNAL | %s %s | excluded from delivery universe",
+                     signal["side"], symbol)
+            last_signal_sent[symbol] = {
+                "side": signal["side"],
+                "sent_at": now,
+                "candle_id": signal["candle_id"],
+            }
+            return
 
         if paper_book.active():
             opened = paper_book.open_trade(signal)
@@ -391,45 +400,6 @@ async def binance_signal_monitor(session, symbols):
                      signal["side"], symbol, signal["confidence"])
         else:
             log.warning("SIGNAL NOT DELIVERED | %s %s", signal["side"], symbol)
-
-    async def confirm_pending_signal(symbol, confirmation_candle):
-        pending = pending_signals.get(symbol)
-        if not pending:
-            return
-        age_ms = confirmation_candle["close_time"] - pending["signal_close_time"]
-        if age_ms <= 0:
-            return
-        if not pending["confirmation_candles"] and age_ms > 120_000:
-            pending_signals.pop(symbol, None)
-            log.info("SIGNAL EXPIRED | %s %s | first 1m candle arrived too late",
-                     pending["signal"]["side"], symbol)
-            return
-        if age_ms > 180_000:
-            pending_signals.pop(symbol, None)
-            log.info("SIGNAL EXPIRED | %s %s | no two 1m candles within 3 minutes",
-                     pending["signal"]["side"], symbol)
-            return
-
-        if confirmation_candle["close_time"] <= pending.get("last_confirmation_time", 0):
-            return
-        pending["confirmation_candles"].append(confirmation_candle)
-        pending["last_confirmation_time"] = confirmation_candle["close_time"]
-        if len(pending["confirmation_candles"]) < 2:
-            return
-
-        pending_signals.pop(symbol, None)
-        confirmed = confirm_signal_with_1m_window(
-            pending["signal"], pending["confirmation_candles"][:2]
-        )
-        if not confirmed:
-            log.info("SIGNAL SKIPPED | %s %s | two 1m candles confirmed a countertrend reversal",
-                     pending["signal"]["side"], symbol)
-            return
-
-        log.info("SIGNAL 2x1m CONFIRMED | %s %s | entry=%.6f | last close=%s",
-                 confirmed["side"], symbol, confirmed["entry"],
-                 confirmation_candle["close_time"])
-        await dispatch_confirmed_signal(confirmed)
 
     # Load only completed candles. Never evaluate an unfinished candle.
     for symbol in symbols:
@@ -487,68 +457,15 @@ async def binance_signal_monitor(session, symbols):
                     }
                     store_closed_candle(histories[symbol][timeframe], candle)
 
-                    if timeframe == "1m":
-                        await confirm_pending_signal(symbol, candle)
-                        continue
                     if timeframe != "5m":
                         continue
 
-                    # Manage virtual positions only after a 5m candle has closed.
                     paper_book.on_candle(symbol, candle)
                     paper_sprint_book.on_candle(symbol, candle)
 
-                    signal = evaluate(symbol, histories[symbol], apply_reversal_filter=False)
-                    if not signal:
-                        continue
-
-                    now = time.time()
-                    previous = last_signal_sent.get(symbol)
-                    if previous:
-                        cooldown = (
-                            SIGNAL_SAME_SIDE_COOLDOWN
-                            if previous["side"] == signal["side"]
-                            else SIGNAL_FLIP_COOLDOWN
-                        )
-                        if now - previous["sent_at"] < cooldown:
-                            continue
-
-                    if symbol not in SIGNAL_DELIVERY_SYMBOLS:
-                        log.info("SHADOW SIGNAL | %s %s | excluded from delivery universe",
-                                 signal["side"], symbol)
-                        last_signal_sent[symbol] = {
-                            "side": signal["side"],
-                            "sent_at": now,
-                            "candle_id": signal["candle_id"],
-                        }
-                        continue
-
-                    existing = pending_signals.get(symbol)
-                    if existing:
-                        age_ms = candle["close_time"] - existing["signal_close_time"]
-                        if age_ms > 180_000:
-                            pending_signals.pop(symbol, None)
-                            log.info("SIGNAL EXPIRED | %s %s | replacing stale pending signal",
-                                     existing["signal"]["side"], symbol)
-                        else:
-                            continue
-
-                    pending_signals[symbol] = {
-                        "signal": signal,
-                        "signal_close_time": candle["close_time"],
-                        "confirmation_candles": [],
-                        "last_confirmation_time": 0,
-                    }
-                    log.info("SIGNAL PENDING 1m CONFIRM | %s %s | reference_entry=%.6f",
-                             signal["side"], symbol, signal["entry"])
-
-                    # Handle websocket ordering where the next 1m closes arrived
-                    # before the corresponding 5m close event.
-                    for recent_1m in list(histories[symbol]["1m"]):
-                        if (candle["close_time"] < recent_1m["close_time"]
-                                <= candle["close_time"] + 180_000):
-                            await confirm_pending_signal(symbol, recent_1m)
-                            if symbol not in pending_signals:
-                                break
+                    signal = evaluate(symbol, histories[symbol])
+                    if signal:
+                        await dispatch_signal(signal)
 
         except asyncio.CancelledError:
             raise
