@@ -7,7 +7,6 @@ import logging
 import os
 import tempfile
 import time
-from datetime import datetime, timezone
 
 log = logging.getLogger("bogdan-intel.paper")
 PATH = os.getenv("PAPER_LEDGER_PATH", "/data/paper_trading.json")
@@ -17,6 +16,16 @@ MAX_OPEN = int(os.getenv("PAPER_MAX_OPEN", "3"))
 MAX_GROSS_LEVERAGE = float(os.getenv("PAPER_MAX_GROSS_LEVERAGE", "2"))
 FEE_RATE = float(os.getenv("PAPER_TAKER_FEE", "0.0005"))
 DURATION_SECONDS = int(os.getenv("PAPER_DURATION_DAYS", "10")) * 86400
+
+# New exit plan: bank 70% at 0.8R, another 20% at 1.5R,
+# and let the final 10% run with a protected/trailing stop.
+TP1_FRACTION = 0.70
+TP2_FRACTION = 0.20
+TP1_R = 0.80
+TP2_R = 1.50
+TP3_R = 2.20
+LOCK_PROFIT_R = 0.10
+TRAIL_BUFFER_R = 0.15
 
 
 def _now():
@@ -110,15 +119,20 @@ class PaperBook:
             "qty": qty, "remaining": qty, "risk_budget": risk_budget,
             "entry_fee": fee, "exit_fees": 0.0, "gross_realized": 0.0,
             "tp1": False, "tp2": False, "opened_at": _now(),
-            "signal_confidence": int(signal.get("confidence", 0))
+            "signal_confidence": int(signal.get("confidence", 0)),
+            "management_version": 2,
+            "risk_distance": distance,
+            "tp1_qty": qty * TP1_FRACTION,
+            "tp2_qty": qty * TP2_FRACTION,
+            "tp3_qty": qty * (1.0 - TP1_FRACTION - TP2_FRACTION),
         }
         self._save_data()
-        log.info("PAPER OPEN | %s %s entry=%.8f stop=%.8f qty=%.8f notional=$%.2f risk=$%.2f fee=$%.4f",
+        log.info("PAPER OPEN | %s %s entry=%.8f stop=%.8f qty=%.8f notional=$%.2f risk=$%.2f fee=$%.4f plan=70%%@0.8R/20%%@1.5R/10%%@2.2R",
                  signal["side"], symbol, entry, stop, qty, notional, risk_budget, fee)
         return True
 
-    def _exit(self, trade, price, fraction, reason):
-        qty = min(trade["remaining"], trade["qty"] * fraction)
+    def _exit_qty(self, trade, price, qty, reason):
+        qty = min(float(trade["remaining"]), max(0.0, float(qty)))
         if qty <= 0:
             return
         direction = 1 if trade["side"] == "LONG" else -1
@@ -126,10 +140,13 @@ class PaperBook:
         fee = price * qty * self.fee_rate
         trade["gross_realized"] += gross
         trade["exit_fees"] += fee
-        trade["remaining"] -= qty
+        trade["remaining"] = max(0.0, float(trade["remaining"]) - qty)
         self.state["balance"] += gross - fee
         log.info("PAPER EXIT | %s %s reason=%s price=%.8f qty=%.8f gross=$%.4f fee=$%.4f",
                  trade["side"], trade["symbol"], reason, price, qty, gross, fee)
+
+    def _exit(self, trade, price, fraction, reason):
+        self._exit_qty(trade, price, trade["qty"] * fraction, reason)
 
     def on_candle(self, symbol, candle):
         trade = self.state["open_trades"].get(symbol)
@@ -138,42 +155,84 @@ class PaperBook:
             return
         high, low = float(candle["high"]), float(candle["low"])
         side = trade["side"]
-        stop = trade["active_stop"]
-        # Conservative intrabar ordering: if stop and target are both touched,
-        # assume the stop filled first.
+        stop = float(trade["active_stop"])
         stop_hit = low <= stop if side == "LONG" else high >= stop
-        if stop_hit:
-            self._exit(trade, stop, 1.0, "STOP")
-            self._close_trade(symbol, "STOP")
-            return
 
-        t1, t2, t3 = trade["targets"]
-        touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
-        if not trade["tp1"] and touched(t1):
-            self._exit(trade, t1, 0.50, "TP1")
-            trade["tp1"] = True
-            trade["active_stop"] = trade["entry"]
-            if (low <= trade["active_stop"] if side == "LONG" else high >= trade["active_stop"]):
-                self._exit(trade, trade["active_stop"], 1.0, "BREAKEVEN")
-                self._close_trade(symbol, "BREAKEVEN")
+        # Keep the original exit rules for positions opened before this release.
+        if int(trade.get("management_version", 1)) < 2:
+            if stop_hit:
+                self._exit(trade, stop, 1.0, "STOP")
+                self._close_trade(symbol, "STOP")
                 return
-        if trade["tp1"] and not trade["tp2"] and touched(t2):
-            self._exit(trade, t2, 0.30, "TP2")  # 60% of the 50% remaining = 30% of original
-            trade["tp2"] = True
-            trade["active_stop"] = t1
-            if (low <= t1 if side == "LONG" else high >= t1):
-                self._exit(trade, t1, 1.0, "TRAILING_STOP")
-                self._close_trade(symbol, "TRAILING_STOP")
+            t1, t2, t3 = trade["targets"]
+            touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
+            if not trade["tp1"] and touched(t1):
+                self._exit(trade, t1, 0.50, "TP1")
+                trade["tp1"] = True
+                trade["active_stop"] = trade["entry"]
+                if (low <= trade["active_stop"] if side == "LONG" else high >= trade["active_stop"]):
+                    self._exit(trade, trade["active_stop"], 1.0, "BREAKEVEN")
+                    self._close_trade(symbol, "BREAKEVEN")
+                    return
+            if trade["tp1"] and not trade["tp2"] and touched(t2):
+                self._exit(trade, t2, 0.30, "TP2")
+                trade["tp2"] = True
+                trade["active_stop"] = t1
+                if (low <= t1 if side == "LONG" else high >= t1):
+                    self._exit(trade, t1, 1.0, "TRAILING_STOP")
+                    self._close_trade(symbol, "TRAILING_STOP")
+                    return
+            if trade["tp2"] and touched(t3):
+                self._exit(trade, t3, 1.0, "TP3")
+                self._close_trade(symbol, "TP3")
                 return
-        if trade["tp2"] and touched(t3):
-            self._exit(trade, t3, 1.0, "TP3")
-            self._close_trade(symbol, "TP3")
-            return
+        else:
+            t1, t2, t3 = trade["targets"]
+            touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
+            if stop_hit:
+                self._exit(trade, stop, 1.0, "PROTECTED_STOP" if trade["tp1"] else "STOP")
+                self._close_trade(symbol, "PROTECTED_STOP" if trade["tp1"] else "STOP")
+                return
+
+            if not trade["tp1"] and touched(t1):
+                self._exit_qty(trade, t1, trade["tp1_qty"], "TP1_70_PERCENT")
+                trade["tp1"] = True
+                risk = float(trade["risk_distance"])
+                fee_buffer = float(trade["entry"]) * (2 * self.fee_rate + 0.0001)
+                lock = max(risk * LOCK_PROFIT_R, fee_buffer)
+                trade["active_stop"] = trade["entry"] + lock if side == "LONG" else trade["entry"] - lock
+                log.info("PAPER PROTECT | %s stop moved into profit zone: %.8f",
+                         symbol, trade["active_stop"])
+
+            if trade["tp1"] and not trade["tp2"] and touched(t2):
+                self._exit_qty(trade, t2, trade["tp2_qty"], "TP2_20_PERCENT")
+                trade["tp2"] = True
+                # The final 10% is protected at TP1 and then trailed behind
+                # the latest completed 5m candle. The new trail applies next candle.
+                trade["active_stop"] = t1
+                log.info("PAPER TRAIL | %s stop advanced to TP1: %.8f", symbol, t1)
+
+            if trade["tp2"] and touched(t3):
+                self._exit(trade, t3, 1.0, "TP3_RUNNER")
+                self._close_trade(symbol, "TP3_RUNNER")
+                return
+
+            if trade["tp2"] and trade["remaining"] > 0:
+                risk = float(trade["risk_distance"])
+                if side == "LONG":
+                    trail = float(candle["low"]) - TRAIL_BUFFER_R * risk
+                    trade["active_stop"] = max(float(trade["active_stop"]), trail)
+                else:
+                    trail = float(candle["high"]) + TRAIL_BUFFER_R * risk
+                    trade["active_stop"] = min(float(trade["active_stop"]), trail)
 
         if _now() - trade["opened_at"] >= 12 * 3600:
             close = float(candle["close"])
             self._exit(trade, close, 1.0, "TIME_EXIT")
             self._close_trade(symbol, "TIME_EXIT")
+            return
+        if trade["remaining"] <= max(1e-12, trade["qty"] * 1e-10):
+            self._close_trade(symbol, "TARGETS_COMPLETED")
             return
         self._save_data()
 
