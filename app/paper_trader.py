@@ -97,6 +97,8 @@ class PaperBook:
         if equity <= 0:
             return False
         entry, stop = float(signal["entry"]), float(signal["stop"])
+        slippage_rate = max(0.0, float(signal.get("paper_slippage_rate", 0.0)))
+        entry *= (1.0 + slippage_rate) if signal["side"] == "LONG" else (1.0 - slippage_rate)
         distance = abs(entry - stop)
         if entry <= 0 or distance <= 0:
             return False
@@ -119,6 +121,7 @@ class PaperBook:
             "targets": [float(x) for x in signal["targets"]],
             "qty": qty, "remaining": qty, "risk_budget": risk_budget,
             "entry_fee": fee, "exit_fees": 0.0, "gross_realized": 0.0,
+            "slippage_rate": slippage_rate,
             "tp1": False, "tp2": False, "opened_at": _now(),
             "signal_confidence": int(signal.get("confidence", 0)),
             "paper_leverage_cap": min(self.max_gross_leverage, max(1.0, float(signal.get("paper_max_gross_leverage", self.max_gross_leverage)))),
@@ -140,6 +143,8 @@ class PaperBook:
         if qty <= 0:
             return
         direction = 1 if trade["side"] == "LONG" else -1
+        slip = float(trade.get("slippage_rate", 0.0))
+        price = price * (1.0 - slip) if direction == 1 else price * (1.0 + slip)
         gross = (price - trade["entry"]) * qty * direction
         fee = price * qty * self.fee_rate
         trade["gross_realized"] += gross
