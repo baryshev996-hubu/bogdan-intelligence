@@ -524,13 +524,25 @@ async def binance_signal_monitor(session, symbols):
                 open_timeout=20,
                 max_size=2**20,
             ) as websocket:
-                await websocket.send(json.dumps({
-                    "method": "SUBSCRIBE",
-                    "params": streams,
-                    "id": 1,
-                }))
-                log.info("BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | intervals=%s",
-                         len(symbols), len(streams), ",".join(INTERVALS))
+                # Binance limits WebSocket control-message payloads. A single
+                # 400-stream SUBSCRIBE frame can be rejected as "Payload too long".
+                # Send small batches over the same connection and pace them.
+                subscription_batch_size = 40
+                for batch_index in range(0, len(streams), subscription_batch_size):
+                    batch = streams[batch_index:batch_index + subscription_batch_size]
+                    await websocket.send(json.dumps({
+                        "method": "SUBSCRIBE",
+                        "params": batch,
+                        "id": 1 + batch_index // subscription_batch_size,
+                    }, separators=(",", ":")))
+                    await asyncio.sleep(0.15)
+
+                log.info(
+                    "BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | batches=%d | batch_size=%d | intervals=%s",
+                    len(symbols), len(streams),
+                    (len(streams) + subscription_batch_size - 1) // subscription_batch_size,
+                    subscription_batch_size, ",".join(INTERVALS)
+                )
 
                 async for raw in websocket:
                     packet = json.loads(raw)
