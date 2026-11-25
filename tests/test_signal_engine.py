@@ -27,7 +27,10 @@ class SignalEngineTests(unittest.TestCase):
         self.assertIsNotNone(macd_histogram(values))
 
     def test_insufficient_history_never_emits_signal(self):
-        self.assertIsNone(evaluate("BTCUSDT", {"5m": [], "15m": [], "1h": []}))
+        diagnostics = {}
+        self.assertIsNone(evaluate("BTCUSDT", {"5m": [], "15m": [], "1h": []},
+                                   diagnostics=diagnostics))
+        self.assertEqual(diagnostics, {"history_short": 1})
 
     def test_stale_history_never_emits_signal(self):
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -42,7 +45,10 @@ class SignalEngineTests(unittest.TestCase):
             "close_time": old_time,
         }
         history = {tf: [dict(candle) for _ in range(60)] for tf in ("5m", "15m", "1h")}
-        self.assertIsNone(evaluate("BTCUSDT", history, as_of_ms=now_ms))
+        diagnostics = {}
+        self.assertIsNone(evaluate("BTCUSDT", history, as_of_ms=now_ms,
+                                   diagnostics=diagnostics))
+        self.assertEqual(diagnostics, {"stale_candles": 1})
 
 
     def test_backtest_long_full_targets(self):
