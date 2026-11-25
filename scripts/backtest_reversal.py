@@ -341,6 +341,9 @@ async def main():
         for reason, count in blocked.items():
             rejected[reason] += count
 
+    for mode in all_rows:
+        all_rows[mode].sort(key=lambda row: row["signal_time"])
+
     report = {
         "period_days": args.days, "symbols_requested": len(symbols),
         "symbols_tested": len(symbols) - len(failures),
