@@ -399,7 +399,7 @@ async def binance_signal_monitor(session, symbols):
 
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
-        if orderflow_paper_book.active():
+        if orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
             from app.order_flow import get_order_flow_confirmation
             flow = get_order_flow_confirmation(symbol, signal["side"], max_age=2.0)
             if not flow or float(flow.get("strength", 0)) < 70:
@@ -421,6 +421,7 @@ async def binance_signal_monitor(session, symbols):
                     strength = float(flow["strength"])
                     leverage = max(10, min(20, 10 + int((strength - 70) / 3)))
                     test_signal["paper_max_gross_leverage"] = leverage
+                    test_signal["paper_slippage_rate"] = 0.0001
                     opened = orderflow_paper_book.open_trade(test_signal)
                     if opened:
                         log.info("ORDERFLOW PAPER OPENED | %s %s | flow=%.1f | leverage_cap=%dx | wall=$%.0f | persistence=%.1fs | balance=%s",
@@ -430,6 +431,9 @@ async def binance_signal_monitor(session, symbols):
                 else:
                     log.warning("ORDERFLOW PAPER SKIP | invalid entry/risk | %s", symbol)
 
+        if orderflow_paper_book.active() and orderflow_paper_book.state["balance"] <= orderflow_paper_book.state["starting_balance"] * 0.95:
+            log.error("ORDERFLOW PAPER DAILY LOSS GUARD | 5%% drawdown reached; no new challenge entries")
+        
         if not ENABLE_SIGNAL_DELIVERY:
             log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s", signal["side"], symbol)
             return
