@@ -28,8 +28,8 @@ class SignalEngineTests(unittest.TestCase):
 
     def test_confirmed_upward_reversal_blocks_short(self):
         candles = []
-        for i in range(24):
-            low = 99.0 + i * 0.02 if i >= 20 else 99.0
+        for i in range(30):
+            low = 99.0 + i * 0.02 if i >= 26 else 99.0
             candles.append({"open": 99.8, "high": 100.5, "low": low,
                             "close": 100.0, "volume": 100.0})
         candles[-1] = {"open": 100.0, "high": 102.5, "low": 100.0,
@@ -39,8 +39,8 @@ class SignalEngineTests(unittest.TestCase):
 
     def test_confirmed_downward_reversal_blocks_long(self):
         candles = []
-        for i in range(24):
-            high = 101.0 - i * 0.02 if i >= 20 else 101.0
+        for i in range(30):
+            high = 101.0 - i * 0.02 if i >= 26 else 101.0
             candles.append({"open": 100.2, "high": high, "low": 99.5,
                             "close": 100.0, "volume": 100.0})
         candles[-1] = {"open": 100.0, "high": 100.0, "low": 97.5,
@@ -50,7 +50,7 @@ class SignalEngineTests(unittest.TestCase):
 
     def test_single_opposite_candle_does_not_confirm_reversal(self):
         candles = [{"open": 100.0, "high": 101.0, "low": 99.0,
-                    "close": 100.2, "volume": 100.0} for _ in range(24)]
+                    "close": 100.2, "volume": 100.0} for _ in range(30)]
         candles[-1] = {"open": 100.0, "high": 100.5, "low": 99.8,
                        "close": 100.4, "volume": 110.0}
         blocked, _ = _reversal_conflict(candles, "SHORT")
