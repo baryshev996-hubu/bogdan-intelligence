@@ -38,6 +38,16 @@ class SignalEngineTests(unittest.TestCase):
         self.assertAlmostEqual(confirmed["stop"], 101.9)
         self.assertAlmostEqual(confirmed["targets"][0], 97.9)
 
+    def test_weak_opposite_1m_candle_does_not_cancel_short(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candle = {"open": 100.0, "high": 100.2, "low": 99.9,
+                  "close": 100.1, "close_time": 1795585259999}
+        confirmed = confirm_signal_with_1m(signal, candle)
+        self.assertIsNotNone(confirmed)
+        self.assertAlmostEqual(confirmed["entry"], 100.1)
+
     def test_1m_reversal_cancels_short_entry(self):
         signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
                   "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
