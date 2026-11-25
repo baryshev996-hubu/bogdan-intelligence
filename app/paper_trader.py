@@ -35,8 +35,14 @@ def _now():
 class PaperBook:
     def __init__(self, *, path=None, start_balance=None, risk_fraction=None,
                  max_open=None, max_gross_leverage=None, fee_rate=None,
-                 ends_at=None, label="10-day"):
+                 ends_at=None, label="10-day", breakeven_trigger_r=0.5,
+                 impulse_exit_r=0.55, impulse_body_ratio=0.65,
+                 impulse_close_position=0.20):
         self.path = path or PATH
+        self.breakeven_trigger_r = float(breakeven_trigger_r)
+        self.impulse_exit_r = float(impulse_exit_r)
+        self.impulse_body_ratio = float(impulse_body_ratio)
+        self.impulse_close_position = float(impulse_close_position)
         self.start_balance = START_BALANCE if start_balance is None else float(start_balance)
         self.risk_fraction = RISK_FRACTION if risk_fraction is None else float(risk_fraction)
         self.max_open = MAX_OPEN if max_open is None else int(max_open)
@@ -51,6 +57,7 @@ class PaperBook:
         return {
             "version": 1, "started_at": now, "ends_at": self.ends_at or now + DURATION_SECONDS,
             "starting_balance": self.start_balance, "balance": self.start_balance,
+            "equity_peak": self.start_balance, "max_drawdown": 0.0,
             "closed_trades": [], "open_trades": {}, "summary_logged": False
         }
 
@@ -121,12 +128,14 @@ class PaperBook:
             "targets": [float(x) for x in signal["targets"]],
             "qty": qty, "remaining": qty, "risk_budget": risk_budget,
             "entry_fee": fee, "exit_fees": 0.0, "gross_realized": 0.0,
+            "exit_notional": 0.0, "last_mark": entry,
             "slippage_rate": slippage_rate,
             "tp1": False, "tp2": False, "opened_at": _now(),
             "signal_confidence": int(signal.get("confidence", 0)),
             "paper_leverage_cap": min(self.max_gross_leverage, max(1.0, float(signal.get("paper_max_gross_leverage", self.max_gross_leverage)))),
             "entry_time": int(signal.get("entry_time", signal.get("candle_id", 0)) or 0),
-            "management_version": 2,
+            "management_version": int(signal.get("paper_management_version", 2)),
+
             "risk_distance": distance,
             "tp1_qty": qty * TP1_FRACTION,
             "tp2_qty": qty * TP2_FRACTION,
@@ -149,6 +158,7 @@ class PaperBook:
         fee = price * qty * self.fee_rate
         trade["gross_realized"] += gross
         trade["exit_fees"] += fee
+        trade["exit_notional"] += price * qty
         trade["remaining"] = max(0.0, float(trade["remaining"]) - qty)
         self.state["balance"] += gross - fee
         log.info("PAPER EXIT | %s %s reason=%s price=%.8f qty=%.8f gross=$%.4f fee=$%.4f",
@@ -172,6 +182,7 @@ class PaperBook:
         if int(candle.get("open_time", 0)) < int(trade.get("entry_time", 0)):
             return
         high, low = float(candle["high"]), float(candle["low"])
+        trade["last_mark"] = float(candle["close"])
         side = trade["side"]
         stop = float(trade["active_stop"])
         stop_hit = low <= stop if side == "LONG" else high >= stop
@@ -204,7 +215,7 @@ class PaperBook:
                 self._exit(trade, t3, 1.0, "TP3")
                 self._close_trade(symbol, "TP3")
                 return
-        else:
+        elif int(trade.get("management_version", 1)) == 2:
             t1, t2, t3 = trade["targets"]
             touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
             if stop_hit:
@@ -244,6 +255,69 @@ class PaperBook:
                     trail = float(candle["high"]) + TRAIL_BUFFER_R * risk
                     trade["active_stop"] = min(float(trade["active_stop"]), trail)
 
+        else:
+            direction = 1 if side == "LONG" else -1
+            risk = float(trade["risk_distance"])
+            entry = float(trade["entry"])
+            close = float(candle["close"])
+            candle_open = float(candle["open"])
+            candle_range = max(high - low, entry * 1e-12)
+            body = close - candle_open
+            body_ratio = abs(body) / candle_range
+            close_near_favorable_extreme = (
+                close >= high - self.impulse_close_position * candle_range
+                if side == "LONG"
+                else close <= low + self.impulse_close_position * candle_range
+            )
+            favorable_close_r = direction * (close - entry) / risk
+
+            if stop_hit:
+                reason = "BREAKEVEN_STOP" if trade.get("breakeven_moved") else "STOP"
+                self._exit(trade, stop, 1.0, reason)
+                self._close_trade(symbol, reason)
+                return
+
+            favorable_excursion = direction * (
+                (high - entry) if side == "LONG" else (entry - low)
+            )
+            if (not trade.get("breakeven_moved")
+                    and favorable_excursion >= self.breakeven_trigger_r * risk):
+                # Include both entry/exit fees and modeled slippage so the protected
+                # stop is near net-zero, not merely equal to the raw entry price.
+                friction = entry * (2 * self.fee_rate + 2 * float(trade.get("slippage_rate", 0.0)))
+                new_stop = entry + direction * friction
+                improves = new_stop > float(trade["active_stop"]) if side == "LONG" else new_stop < float(trade["active_stop"])
+                if improves:
+                    trade["active_stop"] = new_stop
+                    trade["breakeven_moved"] = True
+                    log.info("PAPER SPRINT BREAKEVEN | %s %s trigger=%.2fR stop=%.8f",
+                             side, symbol, self.breakeven_trigger_r, new_stop)
+
+            impulse_candle = (
+                direction * body > 0
+                and body_ratio >= self.impulse_body_ratio
+                and close_near_favorable_extreme
+                and favorable_close_r >= self.impulse_exit_r
+            )
+            if impulse_candle:
+                self._exit(trade, close, 1.0, "IMPULSE_PROFIT")
+                self._close_trade(symbol, "IMPULSE_PROFIT")
+                return
+
+            t1, t2, t3 = trade["targets"]
+            touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
+            if not trade["tp1"] and touched(t1):
+                self._exit_qty(trade, t1, trade["tp1_qty"], "TP1_70_PERCENT")
+                trade["tp1"] = True
+            if trade["tp1"] and not trade["tp2"] and touched(t2):
+                self._exit_qty(trade, t2, trade["tp2_qty"], "TP2_20_PERCENT")
+                trade["tp2"] = True
+                trade["active_stop"] = t1
+            if trade["tp2"] and touched(t3):
+                self._exit(trade, t3, 1.0, "TP3_RUNNER")
+                self._close_trade(symbol, "TP3_RUNNER")
+                return
+
         if _now() - trade["opened_at"] >= 12 * 3600:
             close = float(candle["close"])
             self._exit(trade, close, 1.0, "TIME_EXIT")
@@ -257,13 +331,25 @@ class PaperBook:
     def _close_trade(self, symbol, reason):
         trade = self.state["open_trades"].pop(symbol)
         net = trade["gross_realized"] - trade["entry_fee"] - trade["exit_fees"]
+        exit_qty = max(0.0, float(trade["qty"]) - float(trade["remaining"]))
         row = {
             "symbol": symbol, "side": trade["side"], "opened_at": trade["opened_at"],
-            "closed_at": _now(), "reason": reason, "net_pnl": round(net, 8),
+            "closed_at": _now(), "reason": reason,
+            "entry": round(float(trade["entry"]), 10),
+            "exit_avg_price": round(float(trade.get("exit_notional", 0.0)) / exit_qty, 10) if exit_qty else None,
+            "entry_fee": round(float(trade["entry_fee"]), 8),
+            "exit_fee": round(float(trade["exit_fees"]), 8),
+            "total_fees": round(float(trade["entry_fee"]) + float(trade["exit_fees"]), 8),
+            "gross_pnl": round(float(trade["gross_realized"]), 8),
+            "net_pnl": round(net, 8),
             "risk_budget": round(trade["risk_budget"], 8),
             "net_R": round(net / trade["risk_budget"], 4) if trade["risk_budget"] else 0
         }
         self.state["closed_trades"].append(row)
+        self.state["equity_peak"] = max(float(self.state.get("equity_peak", self.start_balance)), float(self.state["balance"]))
+        peak = float(self.state["equity_peak"])
+        drawdown = (peak - float(self.state["balance"])) / peak if peak > 0 else 0.0
+        self.state["max_drawdown"] = max(float(self.state.get("max_drawdown", 0.0)), drawdown)
         self._save_data()
         log.info("PAPER CLOSED | %s %s net=$%.4f net_R=%.3f balance=$%.2f",
                  row["side"], symbol, net, row["net_R"], self.state["balance"])
@@ -284,9 +370,17 @@ class PaperBook:
         self._save_data()
 
     def status(self):
+        unrealized = 0.0
+        for trade in self.state["open_trades"].values():
+            mark = float(trade.get("last_mark", trade["entry"]))
+            direction = 1 if trade["side"] == "LONG" else -1
+            unrealized += (mark - float(trade["entry"])) * float(trade["remaining"]) * direction
         return {
             "started_at": self.state["started_at"], "ends_at": self.state["ends_at"],
             "balance": round(self.state["balance"], 2),
+            "unrealized_pnl": round(unrealized, 8),
+            "equity": round(float(self.state["balance"]) + unrealized, 8),
+            "max_drawdown": round(float(self.state.get("max_drawdown", 0.0)) * 100, 4),
             "open_trades": len(self.state["open_trades"]),
             "closed_trades": len(self.state["closed_trades"]),
             "active": self.active()
