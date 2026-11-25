@@ -67,6 +67,11 @@ class PaperBook:
                 data = json.load(f)
             if data.get("version") != 1:
                 raise ValueError("Unknown paper ledger version")
+            # Old ledgers have no per-position cursor. The last atomic ledger
+            # write is the latest checkpoint available without reapplying exits.
+            checkpoint = int(os.stat(self.path).st_mtime) // 300 * 300000 - 300000
+            for trade in data["open_trades"].values():
+                trade.setdefault("last_candle_open", max(int(trade.get("entry_time", 0)), checkpoint))
             return data
         except FileNotFoundError:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -110,7 +115,7 @@ class PaperBook:
         if entry <= 0 or distance <= 0:
             return False
         risk_budget = equity * self.risk_fraction
-        qty = risk_budget / distance
+        qty = float(signal.get("paper_qty", risk_budget / distance))
         current_gross = sum(float(t["remaining"]) * float(t["entry"])
                             for t in self.state["open_trades"].values())
         leverage_cap = float(signal.get("paper_max_gross_leverage", self.max_gross_leverage))
@@ -136,6 +141,7 @@ class PaperBook:
             "entry_time": int(signal.get("entry_time", signal.get("candle_id", 0)) or 0),
             "management_version": int(signal.get("paper_management_version", 2)),
 
+            "last_candle_open": int(signal.get("candle_id") or 0),
             "risk_distance": distance,
             "tp1_qty": qty * TP1_FRACTION,
             "tp2_qty": qty * TP2_FRACTION,
@@ -172,7 +178,12 @@ class PaperBook:
         if not trade:
             self._maybe_finish()
             return
-        if not self.active():
+        bar_time = int(candle.get("close_time", _now() * 1000)) // 1000
+        bar_open = candle.get("open_time")
+        if bar_open is not None and int(bar_open) <= trade.get("last_candle_open", -1):
+            return
+        trade["last_bar_at"] = bar_time
+        if bar_time >= self.state["ends_at"]:
             close = float(candle["close"])
             self._exit(trade, close, 1.0, "CHALLENGE_END")
             self._close_trade(symbol, "CHALLENGE_END")
@@ -181,16 +192,20 @@ class PaperBook:
         # manage the new position using price action from before the entry.
         if int(candle.get("open_time", 0)) < int(trade.get("entry_time", 0)):
             return
+        if bar_open is not None:
+            trade["last_candle_open"] = int(bar_open)
         high, low = float(candle["high"]), float(candle["low"])
         trade["last_mark"] = float(candle["close"])
         side = trade["side"]
         stop = float(trade["active_stop"])
+        open_price = float(candle.get("open", stop))
+        stop_fill = min(stop, open_price) if side == "LONG" else max(stop, open_price)
         stop_hit = low <= stop if side == "LONG" else high >= stop
 
         # Keep the original exit rules for positions opened before this release.
         if int(trade.get("management_version", 1)) < 2:
             if stop_hit:
-                self._exit(trade, stop, 1.0, "STOP")
+                self._exit(trade, stop_fill, 1.0, "STOP")
                 self._close_trade(symbol, "STOP")
                 return
             t1, t2, t3 = trade["targets"]
@@ -219,7 +234,7 @@ class PaperBook:
             t1, t2, t3 = trade["targets"]
             touched = (lambda target: high >= target) if side == "LONG" else (lambda target: low <= target)
             if stop_hit:
-                self._exit(trade, stop, 1.0, "PROTECTED_STOP" if trade["tp1"] else "STOP")
+                self._exit(trade, stop_fill, 1.0, "PROTECTED_STOP" if trade["tp1"] else "STOP")
                 self._close_trade(symbol, "PROTECTED_STOP" if trade["tp1"] else "STOP")
                 return
 
@@ -273,7 +288,7 @@ class PaperBook:
 
             if stop_hit:
                 reason = "BREAKEVEN_STOP" if trade.get("breakeven_moved") else "STOP"
-                self._exit(trade, stop, 1.0, reason)
+                self._exit(trade, stop_fill, 1.0, reason)
                 self._close_trade(symbol, reason)
                 return
 
@@ -287,7 +302,7 @@ class PaperBook:
                 friction = entry * (2 * self.fee_rate + 2 * float(trade.get("slippage_rate", 0.0)))
                 new_stop = entry + direction * friction
                 improves = new_stop > float(trade["active_stop"]) if side == "LONG" else new_stop < float(trade["active_stop"])
-                if improves:
+                if improves and direction * (close - new_stop) >= 0:
                     trade["active_stop"] = new_stop
                     trade["breakeven_moved"] = True
                     log.info("PAPER SPRINT BREAKEVEN | %s %s trigger=%.2fR stop=%.8f",
@@ -318,7 +333,7 @@ class PaperBook:
                 self._close_trade(symbol, "TP3_RUNNER")
                 return
 
-        if _now() - trade["opened_at"] >= 12 * 3600:
+        if bar_time - trade["opened_at"] >= 12 * 3600:
             close = float(candle["close"])
             self._exit(trade, close, 1.0, "TIME_EXIT")
             self._close_trade(symbol, "TIME_EXIT")
@@ -334,7 +349,7 @@ class PaperBook:
         exit_qty = max(0.0, float(trade["qty"]) - float(trade["remaining"]))
         row = {
             "symbol": symbol, "side": trade["side"], "opened_at": trade["opened_at"],
-            "closed_at": _now(), "reason": reason,
+            "closed_at": trade.get("last_bar_at", _now()), "reason": reason,
             "entry": round(float(trade["entry"]), 10),
             "exit_avg_price": round(float(trade.get("exit_notional", 0.0)) / exit_qty, 10) if exit_qty else None,
             "entry_fee": round(float(trade["entry_fee"]), 8),

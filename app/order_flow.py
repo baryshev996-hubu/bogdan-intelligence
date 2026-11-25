@@ -53,6 +53,34 @@ def _levels(rows):
     return result
 
 
+async def merged_events(depth, fills):
+    streams = {depth: "depth", fills: "aggTrade"}
+    pending = {asyncio.create_task(ws.recv()): ws for ws in streams}
+    counts = {name: 0 for name in streams.values()}
+    report_at = time.monotonic() + 60
+    try:
+        while True:
+            ready, _ = await asyncio.wait(pending, timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            if not ready:
+                raise TimeoutError("order flow streams idle")
+            for task in ready:
+                ws = pending.pop(task)
+                raw = task.result()
+                counts[streams[ws]] += 1
+                pending[asyncio.create_task(ws.recv())] = ws
+                yield raw
+            if time.monotonic() >= report_at:
+                log.info("ORDER FLOW HEALTH | depth=%d | aggTrade=%d", counts["depth"], counts["aggTrade"])
+                if not all(counts.values()):
+                    raise TimeoutError("one order flow stream idle")
+                counts = {name: 0 for name in streams.values()}
+                report_at = time.monotonic() + 60
+    finally:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def run_order_flow_monitor(session, symbols):
     """Watch persistent large walls and aggressive trade flow on Binance Futures."""
     watch = sorted({str(s).upper() for s in (symbols or []) if str(s).upper().endswith("USDT")})
@@ -60,23 +88,19 @@ async def run_order_flow_monitor(session, symbols):
         log.warning("ORDER FLOW disabled: no USDT perpetual symbols")
         return
 
-    streams = []
-    for symbol in watch:
-        base = symbol.lower()
-        streams.extend((base + "@depth20@100ms", base + "@aggTrade"))
-    url = "wss://fstream.binance.com/market/stream?streams=" + "/".join(streams)
-
+    base = "wss://fstream.binance.com"
+    depth_url = base + "/public/stream?streams=" + "/".join(s.lower() + "@depth20@100ms" for s in watch)
+    trade_url = base + "/market/stream?streams=" + "/".join(s.lower() + "@aggTrade" for s in watch)
+    options = dict(ping_interval=20, ping_timeout=60, close_timeout=10, open_timeout=20, max_size=2**20)
+    cooldowns = {}
     while True:
         walls = {}
-        trades = defaultdict(lambda: deque())
-        cooldowns = {}
+        trades = defaultdict(deque)
+        latest_order_flow.clear()
         try:
-            async with websockets.connect(
-                url, ping_interval=20, ping_timeout=60, close_timeout=10,
-                open_timeout=20, max_size=2**20
-            ) as ws:
-                log.info("ORDER FLOW connected to Binance USD-M Futures: %s symbols", len(watch))
-                async for raw in ws:
+            async with websockets.connect(depth_url, **options) as depth, websockets.connect(trade_url, **options) as fills:
+                log.info("ORDER FLOW connected | symbols=%d", len(watch))
+                async for raw in merged_events(depth, fills):
                     packet = json.loads(raw)
                     data = packet.get("data", packet)
                     event = data.get("e")
@@ -85,6 +109,9 @@ async def run_order_flow_monitor(session, symbols):
                         continue
                     now = time.time()
 
+                    event_time = float(data.get("E", now * 1000)) / 1000
+                    if now - event_time > 2:
+                        continue
                     if event == "aggTrade":
                         try:
                             price = float(data.get("p", 0))
@@ -92,7 +119,7 @@ async def run_order_flow_monitor(session, symbols):
                             usd = price * qty
                             # m=true means buyer was maker, so the aggressor was a seller.
                             side = "SELL" if data.get("m") else "BUY"
-                            trades[symbol].append((now, side, usd))
+                            trades[symbol].append((event_time, side, usd))
                             while trades[symbol] and now - trades[symbol][0][0] > FLOW_WINDOW:
                                 trades[symbol].popleft()
                         except (TypeError, ValueError):
@@ -112,6 +139,8 @@ async def run_order_flow_monitor(session, symbols):
                     if mid <= 0:
                         continue
 
+                    while trades[symbol] and now - trades[symbol][0][0] > FLOW_WINDOW:
+                        trades[symbol].popleft()
                     current = {}
                     for side, levels in (("BID", bids), ("ASK", asks)):
                         for price, qty, notional in levels:
@@ -134,7 +163,7 @@ async def run_order_flow_monitor(session, symbols):
                             continue
 
                         side = key[1]
-                        recent = list(trades[symbol])
+                        recent = trades[symbol]
                         buy_usd = sum(v for ts, taker, v in recent if taker == "BUY")
                         sell_usd = sum(v for ts, taker, v in recent if taker == "SELL")
                         opposing = sell_usd if side == "BID" else buy_usd

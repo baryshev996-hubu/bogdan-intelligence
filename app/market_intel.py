@@ -86,7 +86,7 @@ async def get_binance_flow_context(session, coin, side, reference_price):
             response.raise_for_status()
             return await response.json(content_type=None)
     try:
-        rows = await get_json("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 6})
+        rows = await get_json("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 7})
         closed = [row for row in rows if int(row[6]) < int(time.time() * 1000)]
         if len(closed) >= 2:
             first = float(closed[-2][4])
@@ -201,7 +201,7 @@ async def hyperliquid_whale_monitor(session, coins=None):
                             if total < WHALE_USD or now - last_alert.get(key, 0) < WHALE_COOLDOWN:
                                 continue
                             largest = max(row[1] for row in bucket)
-                            avg_price = sum(row[1] * row[2] for row in bucket) / max(total, 1)
+                            avg_price = total / sum(row[1] / row[2] for row in bucket)
                             last_alert[key] = now
                             context = await get_binance_flow_context(session, coin, side, avg_price)
                             alert_tier = (
@@ -209,6 +209,8 @@ async def hyperliquid_whale_monitor(session, coins=None):
                                 else "🟡 POSSIBLE ABSORPTION" if "ПОГЛОЩЕНИЕ" in context["reaction"]
                                 else "⚪ RAW FLOW, NO CONFIRMATION"
                             )
+                            if alert_tier.startswith("⚪"):
+                                continue
                             await send(session,
                                 "🐳 BOGDAN INTELLIGENCE | " + alert_tier + " | " + coin + "\n"
                                 + "Направление потока: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\n"

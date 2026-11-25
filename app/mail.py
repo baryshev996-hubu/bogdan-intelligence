@@ -7,6 +7,7 @@ SEC, RSS, funding, OI, or generic market notifications are sent.
 import asyncio
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from collections import Counter, deque
@@ -14,7 +15,13 @@ from collections import Counter, deque
 import aiohttp
 from dotenv import load_dotenv
 
-from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
+# Auxiliary monitors import app.mail for delivery. Share one process-wide sender.
+if __name__ == "__main__":
+    sys.modules["app.mail"] = sys.modules[__name__]
+
+from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, evaluate, format_signal
+from app.leverage import build_leverage_paper_signal
+from app.signal_delivery import queue_signal, deliver_signals
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
@@ -121,11 +128,8 @@ AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
 MAX_FUTURES_SYMBOLS = max(1, min(100, int(os.getenv("MAX_FUTURES_SYMBOLS", "100"))))
 # Paper experiments remain on their original configured 30-symbol universe.
 PAPER_TEST_SYMBOLS = set(BINANCE_SYMBOLS)
-SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "5400")))
-SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "900")))
-
-last_signal_sent = {}
 telegram_send_lock = asyncio.Lock()
+signal_waiting = False
 telegram_last_sent = 0.0
 telegram_auth_valid = None
 telegram_auth_checked_at = 0.0
@@ -189,8 +193,7 @@ async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
             raise
         except Exception as exc:
             telegram_auth_valid = False
-            log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s",
-                      type(exc).__name__, str(exc)[:180])
+            log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s", type(exc).__name__)
             return False
 
 
@@ -239,8 +242,6 @@ def is_allowed_telegram_alert(message: str) -> bool:
         return True
     if normalized.startswith("BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION |"):
         return True
-    if normalized.startswith("BOGDAN INTELLIGENCE | ⚪ RAW FLOW, NO CONFIRMATION |"):
-        return True
 
     if normalized.startswith("🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING") or normalized.startswith("BOGDAN INTELLIGENCE | UPCOMING LISTING"):
         return True
@@ -248,7 +249,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
     return False
 
 
-async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
+async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipient_only=None) -> bool:
     """Send an allowlisted alert to every configured Telegram recipient."""
     global telegram_last_sent, telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
 
@@ -265,6 +266,8 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
         ).split(",")
         if item.strip()
     ))
+    if recipient_only is not None:
+        recipients = [recipient_only] if recipient_only in recipients else []
     if not BOT_TOKEN or not recipients:
         log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and at least one Telegram chat ID.")
         return False
@@ -280,12 +283,19 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     any_delivered = False
 
-    async with telegram_send_lock:
-        if telegram_auth_valid is not True:
-            log.warning("TELEGRAM BLOCKED | token authentication is invalid; awaiting credential rotation")
-            return False
-
-        for recipient in recipients:
+    global signal_waiting
+    for recipient in recipients:
+        if recipient_only:
+            signal_waiting = True
+        else:
+            while signal_waiting:
+                await asyncio.sleep(0.05)
+        async with telegram_send_lock:
+            if recipient_only:
+                signal_waiting = False
+            if telegram_auth_valid is not True:
+                log.warning("TELEGRAM BLOCKED | token authentication is invalid; awaiting credential rotation")
+                return any_delivered
             payload = {
                 "chat_id": recipient,
                 "text": message,
@@ -343,14 +353,14 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
 
                 except (aiohttp.ClientError, asyncio.TimeoutError):
                     if attempt == 3:
-                        log.exception("Telegram delivery failed after retries | recipient_suffix=%s",
+                        log.error("Telegram delivery failed after retries | recipient_suffix=%s",
                                       recipient[-4:])
                         break
                     backoff = min(2 ** attempt, 15)
-                    log.warning("Telegram network error; retrying in %ss", backoff, exc_info=True)
+                    log.warning("Telegram network error; retrying in %ss", backoff)
                     await asyncio.sleep(backoff)
                 except Exception:
-                    log.exception("Unexpected Telegram delivery error | recipient_suffix=%s",
+                    log.error("Unexpected Telegram delivery error | recipient_suffix=%s",
                                   recipient[-4:])
                     break
 
@@ -360,9 +370,11 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
     return any_delivered
 
 
-async def load_binance_history(session, symbol: str, interval: str):
+async def load_binance_history(session, symbol: str, interval: str, start=None, limit=200):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": 200}
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start is not None:
+        params["startTime"] = start
     async with session.get(url, params=params, timeout=20) as response:
         response.raise_for_status()
         rows = await response.json(content_type=None)
@@ -452,39 +464,33 @@ async def discover_trading_universe(session):
         return sorted(pinned)
 
 
-def build_leverage_paper_signal(signal, balance):
-    """Size a virtual $20-margin position while capping planned loss at 0.25% equity."""
-    entry = float(signal["entry"])
-    if entry <= 0:
-        return None
-    confidence = int(signal.get("confidence", 0))
-    leverage = 10 if confidence < 80 else 15 if confidence < 85 else 20
-    notional = 20.0 * leverage
-    quantity = notional / entry
-    risk_budget = max(0.0, float(balance)) * 0.0025
-    if risk_budget <= 0 or quantity <= 0:
-        return None
-    direction = 1.0 if signal["side"] == "LONG" else -1.0
-    stop_distance = risk_budget / quantity
-    prepared = dict(signal)
-    prepared["stop"] = entry - direction * stop_distance
-    prepared["targets"] = [
-        entry + direction * 0.0100 * entry,
-        entry + direction * 0.0125 * entry,
-        entry + direction * 0.0150 * entry,
-    ]
-    prepared["paper_management_version"] = 3
-    prepared["paper_max_gross_leverage"] = 20.0
-    prepared["paper_slippage_rate"] = 0.0001
-    prepared["paper_leverage"] = leverage
-    return prepared
-
-
 async def binance_signal_monitor(session, symbols):
     if not symbols:
         log.error("Signal engine stopped: no Binance USD-M Futures symbols configured.")
         return
 
+    signal_symbols = set(symbols)
+    books = (paper_book, paper_sprint_book, paper_sprint_v3_book, orderflow_paper_book, leverage_paper_book)
+    held_symbols = {symbol for book in books for symbol in book.state["open_trades"]}
+    symbols = list(dict.fromkeys([*symbols, *sorted(held_symbols)]))
+
+    async def recover_positions(symbol, through):
+        for book in books:
+            trade = book.state["open_trades"].get(symbol)
+            if not trade:
+                continue
+            cursor = trade["last_candle_open"] + 300000
+            while cursor <= through and symbol in book.state["open_trades"]:
+                rows = await load_binance_history(session, symbol, "5m", start=cursor, limit=499)
+                if not rows or rows[0]["open_time"] != cursor:
+                    raise ValueError(f"missing paper candle {symbol} at {cursor}")
+                for row in rows:
+                    if row["open_time"] > through or symbol not in book.state["open_trades"]:
+                        break
+                    if row["open_time"] != cursor:
+                        raise ValueError(f"gap in paper candles for {symbol} at {cursor}")
+                    book.on_candle(symbol, row)
+                    cursor += 300000
     histories = {
         symbol: {timeframe: deque(maxlen=MAX_CANDLES) for timeframe in INTERVALS}
         for symbol in symbols
@@ -496,27 +502,10 @@ async def binance_signal_monitor(session, symbols):
 
     async def dispatch_signal(signal):
         symbol = signal["symbol"]
-        now = time.time()
-        previous = last_signal_sent.get(symbol)
-        if previous:
-            cooldown = (
-                SIGNAL_SAME_SIDE_COOLDOWN
-                if previous["side"] == signal["side"]
-                else SIGNAL_FLIP_COOLDOWN
-            )
-            if now - previous["sent_at"] < cooldown:
-                log.info("SIGNAL COOLDOWN | %s %s", signal["side"], symbol)
-                return
-
         if SIGNAL_DELIVERY_SYMBOLS and symbol not in SIGNAL_DELIVERY_SYMBOLS:
-            log.info("SHADOW SIGNAL | %s %s | excluded by explicit delivery whitelist",
-                     signal["side"], symbol)
-            last_signal_sent[symbol] = {
-                "side": signal["side"],
-                "sent_at": now,
-                "candle_id": signal["candle_id"],
-            }
             return
+        if ENABLE_SIGNAL_DELIVERY:
+            queue_signal(signal, CHAT_IDS)
 
         if symbol in PAPER_TEST_SYMBOLS and paper_book.active():
             opened = paper_book.open_trade(signal)
@@ -528,7 +517,7 @@ async def binance_signal_monitor(session, symbols):
                 leverage_opened = leverage_paper_book.open_trade(leverage_signal)
                 if leverage_opened:
                     log.info(
-                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | margin=$20 | leverage=%sx | risk<=0.25%% | TP=1.00/1.25/1.50%% | status=%s",
+                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | margin=$20 | leverage=%sx | modeled_stop_risk<=0.25%% | TP=1.00/1.25/1.50%% | status=%s",
                         leverage_signal["side"], symbol, leverage_signal["paper_leverage"],
                         leverage_paper_book.status()
                     )
@@ -569,22 +558,6 @@ async def binance_signal_monitor(session, symbols):
         if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] <= orderflow_paper_book.state["starting_balance"] * 0.95:
             log.error("ORDERFLOW PAPER DAILY LOSS GUARD | 5%% drawdown reached; no new challenge entries")
         
-        if not ENABLE_SIGNAL_DELIVERY:
-            log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s", signal["side"], symbol)
-            return
-
-        delivered = await telegram_send(session, format_signal(signal))
-        if delivered:
-            last_signal_sent[symbol] = {
-                "side": signal["side"],
-                "sent_at": now,
-                "candle_id": signal["candle_id"],
-            }
-            log.info("SIGNAL DELIVERED | %s %s | confidence=%s",
-                     signal["side"], symbol, signal["confidence"])
-        else:
-            log.warning("SIGNAL NOT DELIVERED | %s %s", signal["side"], symbol)
-
     # Load the expanded 100-symbol history concurrently with a strict cap.
     # Binance klines are public market data; no API key or trading permission is used.
     history_semaphore = asyncio.Semaphore(12)
@@ -616,12 +589,11 @@ async def binance_signal_monitor(session, symbols):
         now_mono = time.monotonic()
         # Keep existing PAPER challenges on their original 30-symbol
         # sample while production signal delivery scans the expanded top 100.
-        leverage_paper_book.on_candle(symbol, candle)
-        if symbol in PAPER_TEST_SYMBOLS:
-            paper_book.on_candle(symbol, candle)
-            paper_sprint_book.on_candle(symbol, candle)
-            paper_sprint_v3_book.on_candle(symbol, candle)
-            orderflow_paper_book.on_candle(symbol, candle)
+        await recover_positions(symbol, candle["open_time"] - 300000)
+        for book in books:
+            book.on_candle(symbol, candle)
+        if symbol not in signal_symbols or int(time.time() * 1000) - candle["close_time"] >= 300000:
+            return
 
         # Sprint V3 uses the same unfiltered MTF signal as V2,
         # but its exits and 5x cap are isolated in a separate ledger.
@@ -689,6 +661,17 @@ async def binance_signal_monitor(session, symbols):
                 now_ms = int(time.time() * 1000)
                 history = histories[symbol][timeframe]
                 latest_open_time = history[-1]["open_time"] if history else -1
+                # Retry recovery even when no new signal candle is available.
+                if timeframe == "5m" and history:
+                    await recover_positions(symbol, latest_open_time)
+                if not history or int(rows[0][0]) > latest_open_time + INTERVAL_MS[timeframe]:
+                    rebuilt = await load_binance_history(session, symbol, timeframe)
+                    if rebuilt:
+                        if timeframe == "5m":
+                            await recover_positions(symbol, rebuilt[-1]["open_time"])
+                        history.clear()
+                        history.extend(rebuilt)
+                    return True, 0
                 added = 0
                 for row in rows:
                     candle = {
@@ -724,12 +707,9 @@ async def binance_signal_monitor(session, symbols):
         # Update slower context first so each 5m evaluation sees the latest
         # fully closed 15m and 1h candles from the same polling cycle.
         poll_order = tuple(tf for tf in ("15m", "1h", "5m") if tf in INTERVALS)
-        jobs = (
-            poll_symbol_timeframe(symbol, timeframe)
-            for timeframe in poll_order
-            for symbol in symbols
-        )
-        results = await asyncio.gather(*jobs)
+        results = []
+        for timeframe in poll_order:
+            results.extend(await asyncio.gather(*(poll_symbol_timeframe(symbol, timeframe) for symbol in symbols)))
         successful = sum(1 for ok, _ in results if ok)
         failed = len(results) - successful
         new_candles = sum(count for _, count in results)
@@ -754,15 +734,13 @@ async def main():
     log.info("BOOT | strict Telegram allowlist enabled | telegram_recipients=%d", len(CHAT_IDS))
     log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
-    log.info("SIGNAL DELIVERY | enabled=%s | scope=%s | same_side_cooldown=%ss | flip_cooldown=%ss",
-             ENABLE_SIGNAL_DELIVERY,
-             sorted(SIGNAL_DELIVERY_SYMBOLS) if SIGNAL_DELIVERY_SYMBOLS else "all discovered top-100 symbols",
-             SIGNAL_SAME_SIDE_COOLDOWN, SIGNAL_FLIP_COOLDOWN)
+    log.info("SIGNAL DELIVERY | enabled=%s | one signal per closed candle | recipients=%d",
+             ENABLE_SIGNAL_DELIVERY, len(CHAT_IDS))
     log.info("PAPER TRADING | %s", paper_book.status())
     log.info("PAPER SPRINT V2 | %s | risk=0.50%% | max_open=2 | leverage_cap=3x | ends_at=%s",
-             paper_sprint_book.status(), SPRINT_ENDS_AT)
+             paper_sprint_book.status(), paper_sprint_book.state["ends_at"])
     log.info("PAPER SPRINT V3 5X | %s | risk=0.50%% | max_open=2 | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | ends_at=%s",
-             paper_sprint_v3_book.status(), SPRINT_V3_ENDS_AT)
+             paper_sprint_v3_book.status(), paper_sprint_v3_book.state["ends_at"])
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
     log.info("PAPER LEVERAGE CHALLENGE | %s | margin_per_trade=$20 | leverage=10-20x | risk=0.25%% | max_open=5 | TP=1.00/1.25/1.50%%",
@@ -787,6 +765,7 @@ async def main():
         tasks = [
             binance_signal_monitor(session, universe),
             telegram_auth_monitor(session),
+            deliver_signals(session, telegram_send),
         ]
 
         if ENABLE_MARKET_INTEL:

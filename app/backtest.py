@@ -10,7 +10,7 @@ import bisect
 
 import aiohttp
 
-from app.signal_engine import INTERVALS, evaluate
+from app.signal_engine import INTERVAL_MS, INTERVALS, evaluate
 
 
 log = logging.getLogger("bogdan-backtest")
@@ -19,10 +19,7 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 LIMIT = 1500
 LOOKBACK_DAYS = 45
-INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 HORIZON_BARS = 144  # 12 hours of 5m candles
-SAME_SIDE_COOLDOWN_MS = 6 * 60 * 60 * 1000
-FLIP_COOLDOWN_MS = 60 * 60 * 1000
 TAKER_FEE_RATE = float(os.getenv("BACKTEST_TAKER_FEE", "0.0005"))
 SLIPPAGE_RATE = float(os.getenv("BACKTEST_SLIPPAGE", "0.0001"))
 
@@ -142,7 +139,7 @@ def backtest_symbol(symbol, data):
         log.warning("%s: insufficient historical candles, skipping", symbol)
         return {"trades": [], "candidate_signals": 0, "blocked_signals": 0, "filter_reasons": {}}
     close15, close1h = [c["close_time"] for c in fifteen], [c["close_time"] for c in hourly]
-    results, candidate_signals, last_signal = [], 0, None
+    results, candidate_signals = [], 0
     index = 59
     while index < len(five) - 2:
         as_of = five[index]["close_time"]
@@ -159,18 +156,12 @@ def backtest_symbol(symbol, data):
             index += 1
             continue
         candidate_signals += 1
-        if last_signal:
-            cooldown = SAME_SIDE_COOLDOWN_MS if last_signal["side"] == signal["side"] else FLIP_COOLDOWN_MS
-            if as_of - last_signal["time"] < cooldown:
-                index += 1
-                continue
         gross_r, exit_offset = simulate_trade(signal, five[index + 1:index + 1 + HORIZON_BARS])
         if gross_r is None:
             break
         cost_fraction = 2 * (TAKER_FEE_RATE + SLIPPAGE_RATE)
         cost_r = cost_fraction * signal["entry"] / abs(signal["entry"] - signal["stop"])
-        results.append({"side": signal["side"], "gross_r": gross_r, "net_r": gross_r - cost_r, "time": as_of})
-        last_signal = {"side": signal["side"], "time": as_of}
+        results.append({"side": signal["side"], "gross_r": gross_r, "net_r": gross_r - cost_r, "time": as_of, "exit_time": five[index + 1 + exit_offset]["close_time"]})
         index += exit_offset + 2
     return {"trades": results, "candidate_signals": candidate_signals, "blocked_signals": 0, "filter_reasons": {}}
 
@@ -189,7 +180,7 @@ def report(all_results, label="FILTERED"):
     profit_factor = sum(wins) / abs(sum(losses)) if losses else float("inf")
 
     equity = peak = max_drawdown = 0.0
-    for trade in trades:
+    for trade in sorted(trades, key=lambda t: t["exit_time"]):
         equity += trade["net_r"]
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)

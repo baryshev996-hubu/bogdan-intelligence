@@ -8,6 +8,7 @@ from statistics import mean
 
 
 INTERVALS = ("5m", "15m", "1h")
+INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 MAX_CANDLES = 240
 
 
@@ -211,6 +212,7 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, diagnostics=None):
         "targets": targets,
         "target_r": list(target_r),
         "confidence": confidence,
+        "volume_ratio": volume_ratio,
         "risk_pct": risk / price * 100,
         "entry_zone": [price - 0.15 * atr5, price + 0.15 * atr5],
         "reasons": reasons,
