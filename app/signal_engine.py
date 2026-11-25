@@ -121,7 +121,7 @@ def _reversal_conflict(candles, side):
         momentum = rising_steps >= 3 and current_rsi is not None and current_rsi > 50
         structure_break = last["close"] > max(c["high"] for c in prior)
         impulse = last["close"] > last["open"] and volume_impulse
-        confirmed = ema_pressure or (momentum and (structure_break or impulse)) or (structure_break and impulse)
+        confirmed = ema_pressure or impulse or (momentum and structure_break)
         active = [name for name, flag in (
             ("fast EMA 1m вверх", ema_pressure),
             ("восходящий импульс 1m", momentum),
