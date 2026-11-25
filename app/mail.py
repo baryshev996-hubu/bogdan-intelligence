@@ -515,61 +515,61 @@ async def binance_signal_monitor(session, symbols):
     async def process_closed_5m_candle(symbol, candle):
         nonlocal scan_evaluations, scan_signals, last_scan_report
         now_mono = time.monotonic()
-                # Keep existing PAPER challenges on their original 30-symbol
-                # sample while production signal delivery scans the expanded top 100.
-                if symbol in PAPER_TEST_SYMBOLS:
-                    paper_book.on_candle(symbol, candle)
-                    paper_sprint_book.on_candle(symbol, candle)
-                    paper_sprint_v3_book.on_candle(symbol, candle)
-                    orderflow_paper_book.on_candle(symbol, candle)
-        
-                # Sprint V3 uses the same unfiltered MTF signal as V2,
-                # but its exits and 5x cap are isolated in a separate ledger.
-                if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
-                    sprint_v3_signal = evaluate(symbol, histories[symbol])
-                    if sprint_v3_signal:
-                        sprint_v3_signal = dict(sprint_v3_signal)
-                        sprint_v3_signal["paper_slippage_rate"] = 0.0001
-                        sprint_v3_signal["paper_management_version"] = 3
-                        sprint_v3_signal["paper_max_gross_leverage"] = 5.0
-                        sprint_v3_opened = paper_sprint_v3_book.open_trade(sprint_v3_signal)
-                        if sprint_v3_opened:
-                            log.info(
-                                "PAPER SPRINT V3 OPENED | %s %s | risk=0.50%% | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | status=%s",
-                                sprint_v3_signal["side"], symbol, paper_sprint_v3_book.status()
-                            )
-        
-                # The sprint tests the proven baseline MTF setup independently.
-                # The main PAPER book uses the same baseline MTF setup.
-                if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
-                    sprint_signal = evaluate(symbol, histories[symbol])
-                    if sprint_signal:
-                        sprint_signal = dict(sprint_signal)
-                        sprint_signal["paper_slippage_rate"] = 0.0001
-                        sprint_opened = paper_sprint_book.open_trade(sprint_signal)
-                        if sprint_opened:
-                            log.info(
-                                "PAPER SPRINT V2 OPENED | %s %s | risk=0.50%% | slippage=0.010%% | status=%s",
-                                sprint_signal["side"], symbol, paper_sprint_book.status()
-                            )
-        
-                scan_evaluations += 1
-                signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
-                if signal:
-                    scan_signals += 1
-                    await dispatch_signal(signal)
-        
-                if now_mono - last_scan_report >= 300:
-                    top_rejections = scan_rejections.most_common(6)
+        # Keep existing PAPER challenges on their original 30-symbol
+        # sample while production signal delivery scans the expanded top 100.
+        if symbol in PAPER_TEST_SYMBOLS:
+            paper_book.on_candle(symbol, candle)
+            paper_sprint_book.on_candle(symbol, candle)
+            paper_sprint_v3_book.on_candle(symbol, candle)
+            orderflow_paper_book.on_candle(symbol, candle)
+
+        # Sprint V3 uses the same unfiltered MTF signal as V2,
+        # but its exits and 5x cap are isolated in a separate ledger.
+        if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
+            sprint_v3_signal = evaluate(symbol, histories[symbol])
+            if sprint_v3_signal:
+                sprint_v3_signal = dict(sprint_v3_signal)
+                sprint_v3_signal["paper_slippage_rate"] = 0.0001
+                sprint_v3_signal["paper_management_version"] = 3
+                sprint_v3_signal["paper_max_gross_leverage"] = 5.0
+                sprint_v3_opened = paper_sprint_v3_book.open_trade(sprint_v3_signal)
+                if sprint_v3_opened:
                     log.info(
-                        "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
-                        len(symbols), scan_evaluations, scan_signals,
-                        top_rejections, ",".join(INTERVALS)
+                        "PAPER SPRINT V3 OPENED | %s %s | risk=0.50%% | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | status=%s",
+                        sprint_v3_signal["side"], symbol, paper_sprint_v3_book.status()
                     )
-                    scan_rejections.clear()
-                    scan_evaluations = 0
-                    scan_signals = 0
-                    last_scan_report = now_mono
+
+        # The sprint tests the proven baseline MTF setup independently.
+        # The main PAPER book uses the same baseline MTF setup.
+        if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
+            sprint_signal = evaluate(symbol, histories[symbol])
+            if sprint_signal:
+                sprint_signal = dict(sprint_signal)
+                sprint_signal["paper_slippage_rate"] = 0.0001
+                sprint_opened = paper_sprint_book.open_trade(sprint_signal)
+                if sprint_opened:
+                    log.info(
+                        "PAPER SPRINT V2 OPENED | %s %s | risk=0.50%% | slippage=0.010%% | status=%s",
+                        sprint_signal["side"], symbol, paper_sprint_book.status()
+                    )
+
+        scan_evaluations += 1
+        signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
+        if signal:
+            scan_signals += 1
+            await dispatch_signal(signal)
+
+        if now_mono - last_scan_report >= 300:
+            top_rejections = scan_rejections.most_common(6)
+            log.info(
+                "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
+                len(symbols), scan_evaluations, scan_signals,
+                top_rejections, ",".join(INTERVALS)
+            )
+            scan_rejections.clear()
+            scan_evaluations = 0
+            scan_signals = 0
+            last_scan_report = now_mono
 
     poll_semaphore = asyncio.Semaphore(20)
     poll_interval_seconds = 20
