@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import aiohttp
 
-from app.signal_engine import INTERVALS, evaluate, confirm_signal_with_1m
+from app.signal_engine import INTERVALS, evaluate, confirm_signal_with_1m_window
 
 
 log = logging.getLogger("bogdan-backtest")
@@ -181,31 +181,34 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         signal_time = as_of
         if apply_reversal_filter:
             # Wait for the first fully closed 1m candle after the 5m setup.
-            if j1 >= len(one):
+            if j1 + 2 > len(one):
                 blocked_signals += 1
-                filter_reasons["no post-signal 1m candle"] += 1
+                filter_reasons["no two post-signal 1m candles"] += 1
                 index += 1
                 continue
-            confirmation_candle = one[j1]
-            confirm_time = confirmation_candle["close_time"]
-            if confirm_time <= as_of or confirm_time - as_of > 120_000:
+            confirmation_candles = one[j1:j1 + 2]
+            confirm_time = confirmation_candles[-1]["close_time"]
+            first_confirm_time = confirmation_candles[0]["close_time"]
+            if (first_confirm_time <= as_of or first_confirm_time - as_of > 120_000
+                    or confirm_time - first_confirm_time > 120_000
+                    or confirm_time - as_of > 180_000):
                 blocked_signals += 1
-                filter_reasons["post-signal 1m candle arrived too late"] += 1
+                filter_reasons["two 1m confirmation candles arrived too late"] += 1
                 index += 1
                 continue
-            confirmed_signal = confirm_signal_with_1m(signal, confirmation_candle)
+            confirmed_signal = confirm_signal_with_1m_window(signal, confirmation_candles)
             confirm_label = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(confirm_time / 1000))
             if not confirmed_signal:
                 blocked_signals += 1
-                filter_reasons["next 1m candle did not confirm direction"] += 1
-                log.info("BACKTEST 1m CONFIRM | %s | %s | %s | rejected | open=%.6f close=%.6f entry=%.6f",
+                filter_reasons["two 1m candles confirmed countertrend reversal"] += 1
+                log.info("BACKTEST 1m CONFIRM | %s | %s | %s | rejected | first_close=%.6f last_close=%.6f entry=%.6f",
                          symbol, signal["side"], confirm_label,
-                         confirmation_candle["open"], confirmation_candle["close"], signal["entry"])
+                         confirmation_candles[0]["close"], confirmation_candles[-1]["close"], signal["entry"])
                 index += 1
                 continue
             signal = confirmed_signal
             signal_time = confirm_time
-            filter_reasons["next 1m candle confirmed direction"] += 1
+            filter_reasons["two 1m candles did not confirm countertrend reversal"] += 1
             log.info("BACKTEST 1m CONFIRM | %s | %s | %s | accepted | entry=%.6f",
                      symbol, signal["side"], confirm_label, signal["entry"])
 
