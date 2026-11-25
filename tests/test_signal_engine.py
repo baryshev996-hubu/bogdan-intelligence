@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi, _reversal_conflict
+from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi, _reversal_conflict, confirm_signal_with_1m
 from app.backtest import simulate_trade
 
 
@@ -25,6 +25,38 @@ class SignalEngineTests(unittest.TestCase):
     def test_macd_returns_value_with_enough_data(self):
         values = [100 + i * 0.1 + (i % 4) * 0.03 for i in range(80)]
         self.assertIsNotNone(macd_histogram(values))
+
+    def test_1m_confirmation_reprices_short_entry(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candle = {"open": 100.2, "high": 100.3, "low": 99.8,
+                  "close": 99.9, "close_time": 1795585259999}
+        confirmed = confirm_signal_with_1m(signal, candle)
+        self.assertIsNotNone(confirmed)
+        self.assertAlmostEqual(confirmed["entry"], 99.9)
+        self.assertAlmostEqual(confirmed["stop"], 101.9)
+        self.assertAlmostEqual(confirmed["targets"][0], 97.9)
+
+    def test_1m_reversal_cancels_short_entry(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candle = {"open": 100.0, "high": 100.5, "low": 99.9,
+                  "close": 100.4, "close_time": 1795585259999}
+        self.assertIsNone(confirm_signal_with_1m(signal, candle))
+
+    def test_1m_confirmation_reprices_long_entry(self):
+        signal = {"side": "LONG", "entry": 100.0, "stop": 98.0,
+                  "targets": [102.0, 103.0, 105.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candle = {"open": 100.0, "high": 100.3, "low": 99.8,
+                  "close": 100.2, "close_time": 1795585259999}
+        confirmed = confirm_signal_with_1m(signal, candle)
+        self.assertIsNotNone(confirmed)
+        self.assertAlmostEqual(confirmed["entry"], 100.2)
+        self.assertAlmostEqual(confirmed["stop"], 98.2)
+        self.assertAlmostEqual(confirmed["targets"][0], 102.2)
 
     def test_confirmed_upward_reversal_blocks_short(self):
         candles = []
