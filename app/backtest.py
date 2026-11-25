@@ -180,7 +180,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         candidate_signals += 1
         signal_time = as_of
         if apply_reversal_filter:
-            # Wait for the first fully closed 1m candle after the 5m setup.
+            # Wait for two consecutive fully closed 1m candles after the 5m setup.
             if j1 + 2 > len(one):
                 blocked_signals += 1
                 filter_reasons["no two post-signal 1m candles"] += 1
