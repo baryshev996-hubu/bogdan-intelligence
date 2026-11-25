@@ -20,6 +20,17 @@ MIN_AGGRESSOR_USD = float(os.getenv("ORDER_FLOW_MIN_AGGRESSOR_USD", "250000"))
 COOLDOWN = int(os.getenv("ORDER_FLOW_ALERT_COOLDOWN", "900"))
 FLOW_WINDOW = 10
 MISSING_GRACE = 1.5
+latest_order_flow = {}
+
+
+def get_order_flow_confirmation(symbol, side, max_age=2.0):
+    """Return a fresh, side-aligned wall/absorption snapshot or None."""
+    row = latest_order_flow.get(str(symbol).upper())
+    if not row or time.time() - row.get("ts", 0) > max_age:
+        return None
+    if row.get("side") != str(side).upper():
+        return None
+    return dict(row)
 
 
 def _fmt_price(value):
@@ -161,6 +172,38 @@ async def run_order_flow_monitor(session, symbols):
                             + confirmation
                             + "\nУсловие: дождаться реакции цены и подтверждения структуры. Не входить только по стене."
                         )
+
+                    # Publish a fresh side-specific snapshot for the isolated PAPER experiment.
+                    buy_usd = sum(v for ts, taker, v in trades[symbol] if taker == "BUY")
+                    sell_usd = sum(v for ts, taker, v in trades[symbol] if taker == "SELL")
+                    candidates = []
+                    for key, (notional, distance) in current.items():
+                        state = walls.get(key, {})
+                        age = now - state.get("first", now)
+                        if age < MIN_PERSISTENCE:
+                            continue
+                        wall_side = key[1]
+                        opposing = sell_usd if wall_side == "BID" else buy_usd
+                        supporting = buy_usd if wall_side == "BID" else sell_usd
+                        if opposing < MIN_AGGRESSOR_USD or opposing < max(1.0, supporting) * 1.4:
+                            continue
+                        trade_side = "LONG" if wall_side == "BID" else "SHORT"
+                        imbalance = opposing / max(1.0, supporting)
+                        strength = min(100.0, 55.0 + min(20.0, (notional / MIN_WALL_USD - 1) * 8)
+                                       + min(15.0, (age - MIN_PERSISTENCE) * 1.5)
+                                       + min(10.0, (imbalance - 1.4) * 8))
+                        candidates.append((strength, {
+                            "ts": now, "side": trade_side, "wall_side": wall_side,
+                            "wall_price": key[2], "wall_usd": notional,
+                            "distance_pct": distance, "persistence_sec": age,
+                            "buy_usd_10s": buy_usd, "sell_usd_10s": sell_usd,
+                            "strength": strength, "mid": mid,
+                        }))
+                    aligned = [row for _, row in candidates]
+                    if aligned:
+                        latest_order_flow[symbol] = max(aligned, key=lambda row: row["strength"])
+                    else:
+                        latest_order_flow.pop(symbol, None)
 
                     # If a tracked level leaves the visible top-20, invalidate the watch.
                     for key, state in list(walls.items()):
