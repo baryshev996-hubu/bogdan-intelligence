@@ -210,15 +210,15 @@ async def hyperliquid_whale_monitor(session, coins=None):
                                 else "⚪ RAW FLOW, NO CONFIRMATION"
                             )
                             await send(session,
-                                "🐳 BOGDAN INTELLIGENCE | " + alert_tier + " | " + coin + "\\n"
-                                + "Направление потока: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\\n"
-                                + "Объём за " + str(WHALE_WINDOW_SECONDS) + " сек.: $" + format(total, ",.0f") + "\\n"
-                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\\n"
-                                + "VWAP потока: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\\n"
-                                + "Количество исполнений: " + str(len(bucket)) + "\\n\\n"
-                                + "ПОДТВЕРЖДЕНИЕ BINANCE FUTURES\\n"
-                                + format_flow_context(context) + "\\n\\n"
-                                + "Как читать: подтверждение = цена движется в сторону taker-потока; поглощение = цена идёт против потока; без подтверждения = наблюдать, не входить.\\n"
+                                "🐳 BOGDAN INTELLIGENCE | " + alert_tier + " | " + coin + "\n"
+                                + "Направление потока: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\n"
+                                + "Объём за " + str(WHALE_WINDOW_SECONDS) + " сек.: $" + format(total, ",.0f") + "\n"
+                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\n"
+                                + "VWAP потока: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\n"
+                                + "Количество исполнений: " + str(len(bucket)) + "\n\n"
+                                + "ПОДТВЕРЖДЕНИЕ BINANCE FUTURES\n"
+                                + format_flow_context(context) + "\n\n"
+                                + "Как читать: подтверждение = цена движется в сторону taker-потока; поглощение = цена идёт против потока; без подтверждения = наблюдать, не входить.\n"
                                 + "Это аналитическое уведомление, не торговый сигнал. Hyperliquid показывает только одну площадку."
                             )
                             log.info("HYPERLIQUID FLOW ALERT | %s %s | usd=%.0f | prints=%d",
