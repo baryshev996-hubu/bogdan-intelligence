@@ -121,7 +121,7 @@ def _reversal_conflict(candles, side):
             "EMA 1m разворачивается вверх": last["close"] > e9 and e9 > e21,
             "пробит локальный максимум 1m": last["close"] > max(c["high"] for c in prior),
             "формируются повышающиеся минимумы": higher_lows,
-            "RSI 1m усиливает покупателей": current_rsi is not None and previous_rsi is not None and current_rsi >= 55 and current_rsi > previous_rsi,
+            "RSI 1m усиливает покупателей": current_rsi is not None and previous_rsi is not None and current_rsi >= 55 and previous_rsi >= 52 and current_rsi > previous_rsi,
             "сильная бычья свеча с объёмом": last["close"] > last["open"] and volume_impulse,
         }
         reason = "восходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
@@ -130,7 +130,7 @@ def _reversal_conflict(candles, side):
             "EMA 1m разворачивается вниз": last["close"] < e9 and e9 < e21,
             "пробит локальный минимум 1m": last["close"] < min(c["low"] for c in prior),
             "формируются понижающиеся максимумы": lower_highs,
-            "RSI 1m усиливает продавцов": current_rsi is not None and previous_rsi is not None and current_rsi <= 45 and current_rsi < previous_rsi,
+            "RSI 1m усиливает продавцов": current_rsi is not None and previous_rsi is not None and current_rsi <= 45 and previous_rsi <= 48 and current_rsi < previous_rsi,
             "сильная медвежья свеча с объёмом": last["close"] < last["open"] and volume_impulse,
         }
         reason = "нисходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
