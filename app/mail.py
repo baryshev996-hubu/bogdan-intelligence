@@ -539,7 +539,7 @@ async def binance_signal_monitor(session, symbols):
                         "params": batch,
                         "id": 1 + batch_index // subscription_batch_size,
                     }, separators=(",", ":")))
-                    await asyncio.sleep(0.15)
+                    await asyncio.sleep(0.30)
 
                 log.info(
                     "BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | batches=%d | batch_size=%d | intervals=%s",
@@ -553,6 +553,12 @@ async def binance_signal_monitor(session, symbols):
                     # Raw /ws subscriptions return the event directly.
                     # Ignore the subscription acknowledgement.
                     if "id" in packet and "result" in packet:
+                        if packet.get("result") is None:
+                            log.debug("BINANCE SUBSCRIPTION ACK | id=%s", packet.get("id"))
+                        continue
+                    if "id" in packet and ("code" in packet or "msg" in packet):
+                        log.error("BINANCE SUBSCRIPTION REJECTED | id=%s | code=%s | message=%s",
+                                  packet.get("id"), packet.get("code"), packet.get("msg"))
                         continue
                     item = packet.get("data", packet)
                     kline = item.get("k")
