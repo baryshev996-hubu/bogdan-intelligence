@@ -3,15 +3,15 @@
 Diagnostic only. It never places orders or changes account state.
 """
 import asyncio
-import bisect
 import logging
 import os
 import time
+import bisect
 from collections import defaultdict
 
 import aiohttp
 
-from app.signal_engine import INTERVALS, evaluate, confirm_signal_with_1m_window
+from app.signal_engine import INTERVALS, evaluate
 
 
 log = logging.getLogger("bogdan-backtest")
@@ -20,7 +20,7 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 LIMIT = 1500
 LOOKBACK_DAYS = 45
-INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 HORIZON_BARS = 144  # 12 hours of 5m candles
 SAME_SIDE_COOLDOWN_MS = 6 * 60 * 60 * 1000
 FLIP_COOLDOWN_MS = 60 * 60 * 1000
@@ -137,136 +137,48 @@ def simulate_trade(signal, future_candles):
     return realized_r, min(len(future_candles), HORIZON_BARS) - 1
 
 
-def backtest_symbol(symbol, data, apply_reversal_filter=True):
-    five = data["5m"]
-    fifteen = data["15m"]
-    hourly = data["1h"]
-    one = data.get("1m", [])
-    if min(len(five), len(fifteen), len(hourly)) < 100 or (apply_reversal_filter and len(one) < 100):
+def backtest_symbol(symbol, data):
+    five, fifteen, hourly = data["5m"], data["15m"], data["1h"]
+    if min(len(five), len(fifteen), len(hourly)) < 100:
         log.warning("%s: insufficient historical candles, skipping", symbol)
         return {"trades": [], "candidate_signals": 0, "blocked_signals": 0, "filter_reasons": {}}
-
-    close1 = [c["close_time"] for c in one]
-    close15 = [c["close_time"] for c in fifteen]
-    close1h = [c["close_time"] for c in hourly]
-    results = []
-    candidate_signals = 0
-    blocked_signals = 0
-    filter_reasons = defaultdict(int)
-    last_signal = None
+    close15, close1h = [c["close_time"] for c in fifteen], [c["close_time"] for c in hourly]
+    results, candidate_signals, last_signal = [], 0, None
     index = 59
-
     while index < len(five) - 2:
-        candle = five[index]
-        as_of = candle["close_time"]
-        j1 = bisect.bisect_right(close1, as_of)
-        j15 = bisect.bisect_right(close15, as_of)
-        j1h = bisect.bisect_right(close1h, as_of)
-        if j15 < 60 or j1h < 60 or (apply_reversal_filter and j1 < 30):
+        as_of = five[index]["close_time"]
+        j15, j1h = bisect.bisect_right(close15, as_of), bisect.bisect_right(close1h, as_of)
+        if j15 < 60 or j1h < 60:
             index += 1
             continue
-
-        one_window = one[max(0, j1 - 240):j1]
         signal = evaluate(symbol, {
-            "1m": one_window,
             "5m": five[max(0, index + 1 - 240):index + 1],
             "15m": fifteen[max(0, j15 - 240):j15],
             "1h": hourly[max(0, j1h - 240):j1h],
-        }, as_of_ms=as_of, apply_reversal_filter=False)
+        }, as_of_ms=as_of)
         if not signal:
             index += 1
             continue
-
         candidate_signals += 1
-        signal_time = as_of
-        if apply_reversal_filter:
-            # Wait for two consecutive fully closed 1m candles after the 5m setup.
-            if j1 + 2 > len(one):
-                blocked_signals += 1
-                filter_reasons["no two post-signal 1m candles"] += 1
-                index += 1
-                continue
-            confirmation_candles = one[j1:j1 + 2]
-            confirm_time = confirmation_candles[-1]["close_time"]
-            first_confirm_time = confirmation_candles[0]["close_time"]
-            if (first_confirm_time <= as_of or first_confirm_time - as_of > 120_000
-                    or confirm_time - first_confirm_time > 120_000
-                    or confirm_time - as_of > 180_000):
-                blocked_signals += 1
-                filter_reasons["two 1m confirmation candles arrived too late"] += 1
-                index += 1
-                continue
-            confirmed_signal = confirm_signal_with_1m_window(signal, confirmation_candles)
-            confirm_label = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(confirm_time / 1000))
-            if not confirmed_signal:
-                blocked_signals += 1
-                filter_reasons["two 1m candles confirmed countertrend reversal"] += 1
-                log.info("BACKTEST 1m CONFIRM | %s | %s | %s | rejected | first_close=%.6f last_close=%.6f entry=%.6f",
-                         symbol, signal["side"], confirm_label,
-                         confirmation_candles[0]["close"], confirmation_candles[-1]["close"], signal["entry"])
-                index += 1
-                continue
-            signal = confirmed_signal
-            signal_time = confirm_time
-            filter_reasons["two 1m candles did not confirm countertrend reversal"] += 1
-            log.info("BACKTEST 1m CONFIRM | %s | %s | %s | accepted | entry=%.6f",
-                     symbol, signal["side"], confirm_label, signal["entry"])
-
         if last_signal:
-            cooldown = (SAME_SIDE_COOLDOWN_MS
-                        if last_signal["side"] == signal["side"]
-                        else FLIP_COOLDOWN_MS)
-            if signal_time - last_signal["time"] < cooldown:
+            cooldown = SAME_SIDE_COOLDOWN_MS if last_signal["side"] == signal["side"] else FLIP_COOLDOWN_MS
+            if as_of - last_signal["time"] < cooldown:
                 index += 1
                 continue
-
-        if apply_reversal_filter:
-            # The paper book already processed the 5m candle containing the
-            # 1m confirmation. Management starts on the next completed 5m bar.
-            future = five[index + 2:index + 2 + HORIZON_BARS]
-            gross_r, exit_offset = simulate_trade(signal, future)
-        else:
-            future = five[index + 1:index + 1 + HORIZON_BARS]
-            gross_r, exit_offset = simulate_trade(signal, future)
-
+        gross_r, exit_offset = simulate_trade(signal, five[index + 1:index + 1 + HORIZON_BARS])
         if gross_r is None:
             break
-
         cost_fraction = 2 * (TAKER_FEE_RATE + SLIPPAGE_RATE)
         cost_r = cost_fraction * signal["entry"] / abs(signal["entry"] - signal["stop"])
-        net_r = gross_r - cost_r
-        results.append({
-            "side": signal["side"],
-            "gross_r": gross_r,
-            "net_r": net_r,
-            "time": signal_time,
-        })
-        last_signal = {"side": signal["side"], "time": signal_time}
-        if apply_reversal_filter:
-            index += exit_offset + 3
-        else:
-            index += exit_offset + 2
-
-    return {
-        "trades": results,
-        "candidate_signals": candidate_signals,
-        "blocked_signals": blocked_signals,
-        "filter_reasons": dict(filter_reasons),
-    }
-
+        results.append({"side": signal["side"], "gross_r": gross_r, "net_r": gross_r - cost_r, "time": as_of})
+        last_signal = {"side": signal["side"], "time": as_of}
+        index += exit_offset + 2
+    return {"trades": results, "candidate_signals": candidate_signals, "blocked_signals": 0, "filter_reasons": {}}
 
 def report(all_results, label="FILTERED"):
     trades = [trade for result in all_results.values() for trade in result["trades"]]
     candidates = sum(result["candidate_signals"] for result in all_results.values())
-    blocked = sum(result["blocked_signals"] for result in all_results.values())
-    reason_counts = defaultdict(int)
-    for result in all_results.values():
-        for reason, count in result.get("filter_reasons", {}).items():
-            reason_counts[reason] += count
-    log.info("BACKTEST FILTER COUNTS | %s | candidates=%d blocked=%d passed=%d",
-             label, candidates, blocked, candidates - blocked)
-    for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0])):
-        log.info("BACKTEST 1m FILTER REASON | %s | count=%d", reason, count)
+    log.info("BACKTEST SIGNAL COUNTS | %s | candidates=%d", label, candidates)
     if not trades:
         log.info("BACKTEST %s: no qualifying trades in the loaded sample.", label)
         return
@@ -324,12 +236,8 @@ async def main():
                     data[interval] = []
             datasets[symbol] = data
 
-    baseline = {symbol: backtest_symbol(symbol, data, apply_reversal_filter=False)
-                for symbol, data in datasets.items()}
-    filtered = {symbol: backtest_symbol(symbol, data, apply_reversal_filter=True)
-                for symbol, data in datasets.items()}
-    report(baseline, label="BASELINE WITHOUT 1m FILTER")
-    report(filtered, label="WITH 1m REVERSAL FILTER")
+    baseline = {symbol: backtest_symbol(symbol, data) for symbol, data in datasets.items()}
+    report(baseline, label="BASELINE WITHOUT 1m")
 
 
 if __name__ == "__main__":
