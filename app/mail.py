@@ -399,6 +399,11 @@ async def binance_signal_monitor(session, symbols):
         age_ms = confirmation_candle["close_time"] - pending["signal_close_time"]
         if age_ms <= 0:
             return
+        if not pending["confirmation_candles"] and age_ms > 120_000:
+            pending_signals.pop(symbol, None)
+            log.info("SIGNAL EXPIRED | %s %s | first 1m candle arrived too late",
+                     pending["signal"]["side"], symbol)
+            return
         if age_ms > 180_000:
             pending_signals.pop(symbol, None)
             log.info("SIGNAL EXPIRED | %s %s | no two 1m candles within 3 minutes",
