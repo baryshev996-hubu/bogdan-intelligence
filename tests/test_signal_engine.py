@@ -64,12 +64,12 @@ class SignalEngineTests(unittest.TestCase):
                   "close": 100.1, "close_time": 1795585259999}
         self.assertIsNone(confirm_signal_with_1m(signal, candle))
 
-    def test_short_allows_favorable_move_within_half_r(self):
+    def test_short_allows_large_favorable_move(self):
         signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
                   "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
                   "risk_pct": 2.0, "reasons": []}
-        candle = {"open": 99.3, "high": 99.4, "low": 99.1,
-                  "close": 99.2, "close_time": 1795585259999}
+        candle = {"open": 98.3, "high": 98.4, "low": 98.1,
+                  "close": 98.2, "close_time": 1795585259999}
         self.assertIsNotNone(confirm_signal_with_1m(signal, candle))
 
     def test_short_rejects_adverse_move_beyond_quarter_r(self):
