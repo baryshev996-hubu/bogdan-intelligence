@@ -310,7 +310,8 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
                 "🐳 BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION | ",
             ))
             is_order_flow_card = header.startswith("🧭 ORDER FLOW INTELLIGENCE | ")
-            if (is_signal_card or is_whale_card or is_order_flow_card) and "\n\n<b>" in message:
+            is_listing_card = header == "🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING"
+            if (is_signal_card or is_whale_card or is_order_flow_card or is_listing_card) and "\n\n<b>" in message:
                 payload["parse_mode"] = "HTML"
             recipient_delivered = False
             for attempt in range(4):

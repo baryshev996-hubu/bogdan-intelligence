@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from app.listing_research import research_token, format_research, is_crypto_instrument, excluded_ticker
+
 log = logging.getLogger("bogdan-intel.listings")
 
 ENABLED = os.getenv("ENABLE_UPCOMING_LISTINGS", "true").lower() == "true"
@@ -27,6 +29,7 @@ EXCLUDED = (
     "tokenized stock", "tokenised stock", "pre-ipo", "tradfi", "stock token",
     "leveraged token", " etf", "delist", "removal of", "will remove", "margin trading", "earn", "convert",
     "launchpool", "launchpool subscription", "equity", "equities", "stock",
+    "commodity", "commodities", "forex", "precious metal", "pre-market equity",
 )
 
 LISTING_WORDS = ("will list", "new listing", "spot trading", "spot listing", "listing of", "perpetual", "futures", "swap")
@@ -185,7 +188,22 @@ async def _binance_listings(session):
     except Exception as exc:
         log.warning("Binance CMS API unavailable; trying official announcement HTML: %s",
                     str(exc)[:180])
+        try:
+            data = await _json_get(session,
+                "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query",
+                {"type": 1, "pageNo": 1, "pageSize": 30, "catalogId": 48})
+            result = data.get("data") or {}
+            articles = list(result.get("articles") or [])
+            for catalog in result.get("catalogs") or []:
+                articles.extend(catalog.get("articles") or [])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Binance composite CMS fallback unavailable")
+    if not articles:
         articles = await _binance_listing_page(session)
+    if not articles:
+        raise RuntimeError("No announcement articles parsed; listing coverage unverified")
 
     out = []
     for item in articles:
@@ -283,6 +301,8 @@ async def _okx_listings(session):
             if market_type == "FUTURES" and not (inst.endswith("-USDT-SWAP") or inst.endswith("-USDT")):
                 continue
             base = item.get("baseCcy") or inst.split("-")[0]
+            if not is_crypto_instrument(item) or excluded_ticker(base):
+                continue
             when = datetime.fromtimestamp(list_ms / 1000, tz=timezone.utc)
             out.append({
                 "id": "okx:" + inst_type + ":" + inst + ":" + str(list_ms),
@@ -315,20 +335,37 @@ def _format_alert(event, score, exchanges):
     utc = event["when"].astimezone(timezone.utc)
     kyiv = event["when"].astimezone(KYIV)
     other = ", ".join(sorted(exchanges - {event["exchange"]})) or "пока не подтверждён"
-    return (
-        "🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING\n"
-        f"Токен: {event['ticker'] or 'тикер уточняется'}\n"
-        f"Биржа: {event['exchange']} | {event.get('market_type', 'SPOT')}\n"
-        f"Дата и время: {kyiv:%d.%m.%Y %H:%M} Киев\n"
-        f"Время UTC: {utc:%d.%m.%Y %H:%M}\n"
-        f"Другие подтверждения: {other}\n"
-        f"Оценка события: {score}/100 (не прогноз доходности)\n"
-        "Статус: время подтверждено официальным источником\n"
-        f"Источник: {event['source']}\n"
-        f"Ссылка: {event['url']}\n\n"
-        "Тактика: не покупать вслепую на открытии. Проверить спред, глубину стакана, "
-        "объём и реакцию цены. Вход только после подтверждения импульса и с заранее заданным стопом."
-    )
+    e = html.escape
+    separator = "━━━━━━━━━━━━━━━━━━"
+    blocks = max(0, min(10, int(score / 10 + .5)))
+    lines = [
+        "🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING",
+        "",
+        f"<b>{e(str(event['ticker']))} | NEW LISTING</b>",
+        f"🏛 <b>{e(event['exchange'])} · {e(event.get('market_type', 'SPOT'))}</b>",
+        separator,
+        "🗓 <b>Старт торгов</b>",
+        f"<b>{kyiv:%d.%m.%Y · %H:%M} Киев</b>",
+        f"UTC: {utc:%d.%m.%Y · %H:%M}",
+        separator,
+        f"📊 <b>Оценка события: {score}/100</b>",
+        "🟩" * blocks + "⬜" * (10 - blocks),
+        "Оценка подтверждения и близости события, не вероятность прибыли.",
+        f"Другие биржи: {e(other)}",
+        separator,
+    ]
+    lines.extend(format_research(event.get("research") or {}))
+    lines.extend([
+        separator,
+        "⚠️ <b>Перед входом</b>",
+        "Проверить спред, глубину стакана, объём и реакцию цены. Не покупать вслепую на открытии.",
+        "Листинг не гарантирует рост. Стоп и размер позиции определить заранее.",
+        separator,
+        f"Источник: {e(event['source'])}",
+        e(event['url']),
+        "<i>Официальное расписание | Аналитика, не торговый сигнал</i>",
+    ])
+    return "\n".join(lines)
 
 
 async def run_upcoming_listings_monitor(session):
@@ -359,7 +396,7 @@ async def run_upcoming_listings_monitor(session):
         horizon = now.timestamp() + LOOKAHEAD_HOURS * 3600
         by_ticker = {}
         for event in gathered:
-            if not event["ticker"]:
+            if not event["ticker"] or excluded_ticker(event["ticker"]):
                 continue
             if not now.timestamp() < event["when"].timestamp() <= horizon:
                 continue
@@ -367,7 +404,7 @@ async def run_upcoming_listings_monitor(session):
 
         candidates = []
         for event in gathered:
-            if not event["ticker"] or not now.timestamp() < event["when"].timestamp() <= horizon:
+            if not event["ticker"] or excluded_ticker(event["ticker"]) or not now.timestamp() < event["when"].timestamp() <= horizon:
                 continue
             exchanges = by_ticker.get((event["ticker"], event.get("market_type", "SPOT")), {event["exchange"]})
             score = _event_score(event, len(exchanges))
@@ -377,6 +414,7 @@ async def run_upcoming_listings_monitor(session):
         candidates.sort(key=lambda row: row[0]["when"])
         for event, score, exchanges in candidates:
             from app.mail import telegram_send
+            event["research"] = await research_token(session, event)
             delivered = await telegram_send(session, _format_alert(event, score, exchanges))
             if delivered:
                 seen.add(event["id"])
