@@ -11,4 +11,4 @@ COPY tests ./tests
 
 RUN python -m unittest discover -s tests -v
 
-CMD ["python", "-m", "app.main"]
+CMD ["python", "-m", "app.mail"]
