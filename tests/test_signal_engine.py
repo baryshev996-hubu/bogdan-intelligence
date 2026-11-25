@@ -48,6 +48,14 @@ class SignalEngineTests(unittest.TestCase):
         blocked, _ = _reversal_conflict(candles, "LONG")
         self.assertTrue(blocked)
 
+    def test_high_volume_countertrend_impulse_blocks_entry(self):
+        candles = [{"open": 100.0, "high": 101.0, "low": 99.0,
+                    "close": 100.0, "volume": 100.0} for _ in range(30)]
+        candles[-1] = {"open": 100.0, "high": 100.8, "low": 99.9,
+                       "close": 100.7, "volume": 160.0}
+        blocked, _ = _reversal_conflict(candles, "SHORT")
+        self.assertTrue(blocked)
+
     def test_single_opposite_candle_does_not_confirm_reversal(self):
         candles = [{"open": 100.0, "high": 101.0, "low": 99.0,
                     "close": 100.2, "volume": 100.0} for _ in range(30)]
