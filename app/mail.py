@@ -84,9 +84,11 @@ BINANCE_SYMBOLS = [
     for item in os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,LTCUSDT,BCHUSDT,TRXUSDT,ETCUSDT,XLMUSDT,SUIUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,INJUSDT,UNIUSDT,FILUSDT,AAVEUSDT,RENDERUSDT,TAOUSDT,HBARUSDT,1000PEPEUSDT,1000SHIBUSDT,ATOMUSDT").split(",")
     if item.strip()
 ]
+# Empty means deliver signals for every symbol in the dynamically selected universe.
+# Set SIGNAL_DELIVERY_SYMBOLS explicitly only when a restricted watchlist is desired.
 SIGNAL_DELIVERY_SYMBOLS = {
     item.strip().upper()
-    for item in os.getenv("SIGNAL_DELIVERY_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOTUSDT,LTCUSDT,BCHUSDT,TRXUSDT,ETCUSDT,XLMUSDT,SUIUSDT,NEARUSDT,APTUSDT,ARBUSDT,OPUSDT,INJUSDT,UNIUSDT,FILUSDT,AAVEUSDT,RENDERUSDT,TAOUSDT,HBARUSDT,1000PEPEUSDT,1000SHIBUSDT,ATOMUSDT").split(",")
+    for item in os.getenv("SIGNAL_DELIVERY_SYMBOLS", "").split(",")
     if item.strip()
 }
 ENABLE_SIGNAL_DELIVERY = os.getenv("ENABLE_SIGNAL_DELIVERY", "true").lower() == "true"
@@ -95,9 +97,11 @@ ENABLE_ORDER_FLOW = os.getenv("ENABLE_ORDER_FLOW", "true").lower() == "true"
 ENABLE_ARKHAM = os.getenv("ENABLE_ARKHAM", "false").lower() == "true"
 ENABLE_UPCOMING_LISTINGS = os.getenv("ENABLE_UPCOMING_LISTINGS", "true").lower() == "true"
 AUTO_DISCOVER_ALTS = os.getenv("AUTO_DISCOVER_ALTS", "true").lower() == "true"
-MAX_DISCOVERED_ALTS = max(0, min(30, int(os.getenv("MAX_DISCOVERED_ALTS", "0"))))
-SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "21600")))
-SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "3600")))
+MAX_FUTURES_SYMBOLS = max(1, min(100, int(os.getenv("MAX_FUTURES_SYMBOLS", "100"))))
+# Paper experiments remain on their original configured 30-symbol universe.
+PAPER_TEST_SYMBOLS = set(BINANCE_SYMBOLS)
+SIGNAL_SAME_SIDE_COOLDOWN = max(0, int(os.getenv("SIGNAL_SAME_SIDE_COOLDOWN", "5400")))
+SIGNAL_FLIP_COOLDOWN = max(0, int(os.getenv("SIGNAL_FLIP_COOLDOWN", "900")))
 
 last_signal_sent = {}
 telegram_send_lock = asyncio.Lock()
@@ -327,11 +331,10 @@ def store_closed_candle(history, candle):
 
 
 async def discover_trading_universe(session):
-    """Keep configured markets and optionally add the most liquid USDT perpetuals."""
+    """Select the 100 most liquid, currently tradable Binance USDT-M perpetuals."""
     pinned = set(BINANCE_SYMBOLS)
-    if not pinned:
-        return []
     if not AUTO_DISCOVER_ALTS:
+        log.warning("AUTO_DISCOVER_ALTS=false | using configured fallback universe (%d symbols)", len(pinned))
         return sorted(pinned)
 
     try:
@@ -349,36 +352,42 @@ async def discover_trading_universe(session):
             and row.get("contractType") == "PERPETUAL"
             and row.get("quoteAsset") == "USDT"
             and row.get("symbol", "").endswith("USDT")
-            # Match quote-asset suffixes only. Substring checks wrongly reject
-            # BNBUSDT, APTUSDT, ARBUSDT, DOTUSDT and 1000SHIBUSDT.
-            and not row.get("symbol", "").endswith(("USDC", "BUSD", "TUSD", "FDUSD"))
         }
 
-        valid_pinned = pinned & eligible
-        rejected = sorted(pinned - eligible)
-        if rejected:
-            log.warning("Configured symbols not currently tradable as USDT perpetuals: %s", rejected)
-
         ranked = []
+        seen = set()
         for row in tickers:
-            symbol = row.get("symbol")
-            if symbol in eligible and symbol not in pinned:
-                try:
-                    ranked.append((float(row.get("quoteVolume", 0)), symbol))
-                except (TypeError, ValueError):
-                    continue
+            symbol = str(row.get("symbol", "")).upper()
+            if symbol not in eligible or symbol in seen:
+                continue
+            try:
+                quote_volume = float(row.get("quoteVolume", 0))
+            except (TypeError, ValueError):
+                continue
+            if quote_volume > 0:
+                ranked.append((quote_volume, symbol))
+                seen.add(symbol)
 
-        additions = [symbol for _, symbol in sorted(ranked, reverse=True)[:MAX_DISCOVERED_ALTS]]
-        universe = sorted(valid_pinned | set(additions))
-        if len(universe) < 21:
-            log.error("Trading universe below requested 21 markets | valid=%d", len(universe))
-        log.info("Trading universe ready | configured=%d valid=%d discovered=%d total=%d",
-                 len(pinned), len(valid_pinned), len(additions), len(universe))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        universe = [symbol for _, symbol in ranked[:MAX_FUTURES_SYMBOLS]]
+        if not universe:
+            raise RuntimeError("Binance returned no eligible USDT-M perpetual tickers")
+
+        missing_pinned = sorted(pinned - set(universe))
+        log.info(
+            "BINANCE FUTURES UNIVERSE | selected_top=%d | eligible=%d | configured_fallback=%d | pinned_outside_top=%d",
+            len(universe), len(eligible), len(pinned), len(missing_pinned)
+        )
+        if missing_pinned:
+            log.info("Configured symbols outside top %d by quote volume: %s",
+                     MAX_FUTURES_SYMBOLS, missing_pinned)
+        log.info("SIGNAL SCAN UNIVERSE | top %d USDT-M perpetuals by 24h quote volume",
+                 len(universe))
         return universe
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.exception("Altcoin discovery failed; using configured symbols only")
+        log.exception("Binance top-100 discovery failed; using configured symbols only")
         return sorted(pinned)
 
 
@@ -406,8 +415,8 @@ async def binance_signal_monitor(session, symbols):
                 log.info("SIGNAL COOLDOWN | %s %s", signal["side"], symbol)
                 return
 
-        if symbol not in SIGNAL_DELIVERY_SYMBOLS:
-            log.info("SHADOW SIGNAL | %s %s | excluded from delivery universe",
+        if SIGNAL_DELIVERY_SYMBOLS and symbol not in SIGNAL_DELIVERY_SYMBOLS:
+            log.info("SHADOW SIGNAL | %s %s | excluded by explicit delivery whitelist",
                      signal["side"], symbol)
             last_signal_sent[symbol] = {
                 "side": signal["side"],
@@ -416,13 +425,13 @@ async def binance_signal_monitor(session, symbols):
             }
             return
 
-        if paper_book.active():
+        if symbol in PAPER_TEST_SYMBOLS and paper_book.active():
             opened = paper_book.open_trade(signal)
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
-        if orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
+        if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
             from app.order_flow import get_order_flow_confirmation
             flow = get_order_flow_confirmation(symbol, signal["side"], max_age=2.0)
             if not flow or float(flow.get("strength", 0)) < 70:
@@ -454,7 +463,7 @@ async def binance_signal_monitor(session, symbols):
                 else:
                     log.warning("ORDERFLOW PAPER SKIP | invalid entry/risk | %s", symbol)
 
-        if orderflow_paper_book.active() and orderflow_paper_book.state["balance"] <= orderflow_paper_book.state["starting_balance"] * 0.95:
+        if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] <= orderflow_paper_book.state["starting_balance"] * 0.95:
             log.error("ORDERFLOW PAPER DAILY LOSS GUARD | 5%% drawdown reached; no new challenge entries")
         
         if not ENABLE_SIGNAL_DELIVERY:
@@ -473,9 +482,12 @@ async def binance_signal_monitor(session, symbols):
         else:
             log.warning("SIGNAL NOT DELIVERED | %s %s", signal["side"], symbol)
 
-    # Load only completed candles. Never evaluate an unfinished candle.
-    for symbol in symbols:
-        for timeframe in INTERVALS:
+    # Load the expanded 100-symbol history concurrently with a strict cap.
+    # Binance klines are public market data; no API key or trading permission is used.
+    history_semaphore = asyncio.Semaphore(12)
+
+    async def load_symbol_history(symbol, timeframe):
+        async with history_semaphore:
             try:
                 rows = await load_binance_history(session, symbol, timeframe)
                 histories[symbol][timeframe].extend(rows)
@@ -485,6 +497,13 @@ async def binance_signal_monitor(session, symbols):
                 raise
             except Exception:
                 log.exception("History load failed | %s | %s", symbol, timeframe)
+
+    # Load only completed candles. Never evaluate an unfinished candle.
+    await asyncio.gather(*(
+        load_symbol_history(symbol, timeframe)
+        for symbol in symbols
+        for timeframe in INTERVALS
+    ))
 
     streams = "/".join(
         f"{symbol.lower()}@kline_{timeframe}"
@@ -532,14 +551,17 @@ async def binance_signal_monitor(session, symbols):
                     if timeframe != "5m":
                         continue
 
-                    paper_book.on_candle(symbol, candle)
-                    paper_sprint_book.on_candle(symbol, candle)
-                    paper_sprint_v3_book.on_candle(symbol, candle)
-                    orderflow_paper_book.on_candle(symbol, candle)
+                    # Keep existing PAPER challenges on their original 30-symbol
+                    # sample while production signal delivery scans the expanded top 100.
+                    if symbol in PAPER_TEST_SYMBOLS:
+                        paper_book.on_candle(symbol, candle)
+                        paper_sprint_book.on_candle(symbol, candle)
+                        paper_sprint_v3_book.on_candle(symbol, candle)
+                        orderflow_paper_book.on_candle(symbol, candle)
 
                     # Sprint V3 uses the same unfiltered MTF signal as V2,
                     # but its exits and 5x cap are isolated in a separate ledger.
-                    if paper_sprint_v3_book.active():
+                    if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
                         sprint_v3_signal = evaluate(
                             symbol, histories[symbol], apply_reversal_filter=False
                         )
@@ -557,7 +579,7 @@ async def binance_signal_monitor(session, symbols):
 
                     # The sprint tests the proven baseline MTF setup independently.
                     # The main PAPER book keeps its existing 1m reversal filter.
-                    if paper_sprint_book.active():
+                    if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
                         sprint_signal = evaluate(
                             symbol, histories[symbol], apply_reversal_filter=False
                         )
@@ -592,8 +614,10 @@ async def main():
     log.info("BOOT | strict Telegram allowlist enabled")
     log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
-    log.info("SIGNAL DELIVERY | enabled=%s | symbols=%d | %s",
-             ENABLE_SIGNAL_DELIVERY, len(SIGNAL_DELIVERY_SYMBOLS), sorted(SIGNAL_DELIVERY_SYMBOLS))
+    log.info("SIGNAL DELIVERY | enabled=%s | scope=%s | same_side_cooldown=%ss | flip_cooldown=%ss",
+             ENABLE_SIGNAL_DELIVERY,
+             sorted(SIGNAL_DELIVERY_SYMBOLS) if SIGNAL_DELIVERY_SYMBOLS else "all discovered top-100 symbols",
+             SIGNAL_SAME_SIDE_COOLDOWN, SIGNAL_FLIP_COOLDOWN)
     log.info("PAPER TRADING | %s", paper_book.status())
     log.info("PAPER SPRINT V2 | %s | risk=0.50%% | max_open=2 | leverage_cap=3x | ends_at=%s",
              paper_sprint_book.status(), SPRINT_ENDS_AT)
