@@ -510,8 +510,8 @@ async def binance_signal_monitor(session, symbols):
         for symbol in symbols
         for timeframe in INTERVALS
     ]
-    # Subscribe over a raw stream connection to avoid an oversized URL when
-    # scanning 400 kline streams (100 symbols x 4 intervals).
+    # Subscribe over a raw stream connection to avoid oversized subscription frames
+    # while scanning 300 kline streams (100 symbols x 3 intervals).
     url = "wss://fstream.binance.com/ws"
 
     while True:
@@ -525,7 +525,7 @@ async def binance_signal_monitor(session, symbols):
                 max_size=2**20,
             ) as websocket:
                 # Binance limits WebSocket control-message payloads. A single
-                # 400-stream SUBSCRIBE frame can be rejected as "Payload too long".
+                # 300-stream SUBSCRIBE frame can be rejected as "Payload too long".
                 # Send small batches over the same connection and pace them.
                 subscription_batch_size = 40
                 for batch_index in range(0, len(streams), subscription_batch_size):
@@ -585,9 +585,7 @@ async def binance_signal_monitor(session, symbols):
                     # Sprint V3 uses the same unfiltered MTF signal as V2,
                     # but its exits and 5x cap are isolated in a separate ledger.
                     if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
-                        sprint_v3_signal = evaluate(
-                            symbol, histories[symbol], apply_reversal_filter=False
-                        )
+                        sprint_v3_signal = evaluate(symbol, histories[symbol])
                         if sprint_v3_signal:
                             sprint_v3_signal = dict(sprint_v3_signal)
                             sprint_v3_signal["paper_slippage_rate"] = 0.0001
@@ -603,9 +601,7 @@ async def binance_signal_monitor(session, symbols):
                     # The sprint tests the proven baseline MTF setup independently.
                     # The main PAPER book also uses the baseline MTF setup without the 1m reversal veto.
                     if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
-                        sprint_signal = evaluate(
-                            symbol, histories[symbol], apply_reversal_filter=False
-                        )
+                        sprint_signal = evaluate(symbol, histories[symbol])
                         if sprint_signal:
                             sprint_signal = dict(sprint_signal)
                             sprint_signal["paper_slippage_rate"] = 0.0001
@@ -616,7 +612,7 @@ async def binance_signal_monitor(session, symbols):
                                     sprint_signal["side"], symbol, paper_sprint_book.status()
                                 )
 
-                    signal = evaluate(symbol, histories[symbol], apply_reversal_filter=False)
+                    signal = evaluate(symbol, histories[symbol])
                     if signal:
                         await dispatch_signal(signal)
 
