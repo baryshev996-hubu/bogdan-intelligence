@@ -120,6 +120,7 @@ class PaperBook:
             "entry_fee": fee, "exit_fees": 0.0, "gross_realized": 0.0,
             "tp1": False, "tp2": False, "opened_at": _now(),
             "signal_confidence": int(signal.get("confidence", 0)),
+            "entry_time": int(signal.get("entry_time", signal.get("candle_id", 0)) or 0),
             "management_version": 2,
             "risk_distance": distance,
             "tp1_qty": qty * TP1_FRACTION,
@@ -152,6 +153,10 @@ class PaperBook:
         trade = self.state["open_trades"].get(symbol)
         if not trade:
             self._maybe_finish()
+            return
+        # A 5m candle that began before a delayed 1m-confirmed entry must not
+        # manage the new position using price action from before the entry.
+        if int(candle.get("open_time", 0)) < int(trade.get("entry_time", 0)):
             return
         high, low = float(candle["high"]), float(candle["low"])
         side = trade["side"]
