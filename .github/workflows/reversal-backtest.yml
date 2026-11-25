@@ -36,6 +36,8 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Check Binance public archive access
+        run: curl -fL --retry 2 -o /tmp/btc-5m.zip https://data.binance.vision/data/futures/um/monthly/klines/BTCUSDT/5m/BTCUSDT-5m-2026-10.zip && unzip -t /tmp/btc-5m.zip | tail -n 2
       - name: Unit tests
         run: python -m unittest tests.test_reversal_filter -v
       - name: Run historical A-B backtest
