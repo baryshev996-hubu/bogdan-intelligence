@@ -169,7 +169,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
 
 async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
     """Send only allowlisted alerts, with serialization and bounded retries."""
-    global telegram_last_sent
+    global telegram_last_sent, telegram_auth_valid, telegram_auth_checked_at
 
     if not is_allowed_telegram_alert(message):
         first_line = next((line.strip() for line in str(message).splitlines() if line.strip()), "<empty>")
@@ -229,7 +229,6 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
                         continue
 
                     if response.status == 401:
-                        global telegram_auth_valid, telegram_auth_checked_at
                         telegram_auth_valid = False
                         telegram_auth_checked_at = time.monotonic()
                         log.critical(
