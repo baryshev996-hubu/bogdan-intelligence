@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import aiohttp
 
-from app.signal_engine import INTERVALS, evaluate
+from app.signal_engine import INTERVALS, evaluate, _reversal_conflict
 
 
 log = logging.getLogger("bogdan-backtest")
@@ -144,12 +144,14 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
     one = data.get("1m", [])
     if min(len(five), len(fifteen), len(hourly)) < 100 or (apply_reversal_filter and len(one) < 100):
         log.warning("%s: insufficient historical candles, skipping", symbol)
-        return []
+        return {"trades": [], "candidate_signals": 0, "blocked_signals": 0}
 
     close1 = [c["close_time"] for c in one]
     close15 = [c["close_time"] for c in fifteen]
     close1h = [c["close_time"] for c in hourly]
     results = []
+    candidate_signals = 0
+    blocked_signals = 0
     last_signal = None
     index = 59
 
@@ -159,19 +161,28 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         j1 = bisect.bisect_right(close1, as_of)
         j15 = bisect.bisect_right(close15, as_of)
         j1h = bisect.bisect_right(close1h, as_of)
-        if j15 < 60 or j1h < 60 or (apply_reversal_filter and j1 < 24):
+        if j15 < 60 or j1h < 60 or (apply_reversal_filter and j1 < 30):
             index += 1
             continue
 
+        one_window = one[max(0, j1 - 240):j1]
         signal = evaluate(symbol, {
-            "1m": one[max(0, j1 - 240):j1],
+            "1m": one_window,
             "5m": five[max(0, index + 1 - 240):index + 1],
             "15m": fifteen[max(0, j15 - 240):j15],
             "1h": hourly[max(0, j1h - 240):j1h],
-        }, as_of_ms=as_of, apply_reversal_filter=apply_reversal_filter)
+        }, as_of_ms=as_of, apply_reversal_filter=False)
         if not signal:
             index += 1
             continue
+
+        candidate_signals += 1
+        if apply_reversal_filter:
+            blocked, _reason = _reversal_conflict(one_window, signal["side"])
+            if blocked:
+                blocked_signals += 1
+                index += 1
+                continue
 
         if last_signal:
             cooldown = (SAME_SIDE_COOLDOWN_MS
@@ -199,13 +210,21 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         last_signal = {"side": signal["side"], "time": as_of}
         index += exit_offset + 2
 
-    return results
+    return {
+        "trades": results,
+        "candidate_signals": candidate_signals,
+        "blocked_signals": blocked_signals,
+    }
 
 
 def report(all_results, label="FILTERED"):
-    trades = [trade for rows in all_results.values() for trade in rows]
+    trades = [trade for result in all_results.values() for trade in result["trades"]]
+    candidates = sum(result["candidate_signals"] for result in all_results.values())
+    blocked = sum(result["blocked_signals"] for result in all_results.values())
+    log.info("BACKTEST FILTER COUNTS | %s | candidates=%d blocked=%d passed=%d",
+             label, candidates, blocked, candidates - blocked)
     if not trades:
-        log.info("BACKTEST %s: no qualifying signals in the loaded sample.", label)
+        log.info("BACKTEST %s: no qualifying trades in the loaded sample.", label)
         return
 
     wins = [t["net_r"] for t in trades if t["net_r"] > 0]
@@ -228,7 +247,8 @@ def report(all_results, label="FILTERED"):
         label, len(trades), len(wins), len(losses), 100 * len(wins) / len(trades),
         avg_r, total_r, profit_factor, max_drawdown
     )
-    for symbol, rows in all_results.items():
+    for symbol, result in all_results.items():
+        rows = result["trades"]
         if not rows:
             log.info("BACKTEST | %s: no signals", symbol)
             continue
