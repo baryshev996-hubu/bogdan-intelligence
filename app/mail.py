@@ -505,12 +505,14 @@ async def binance_signal_monitor(session, symbols):
         for timeframe in INTERVALS
     ))
 
-    streams = "/".join(
+    streams = [
         f"{symbol.lower()}@kline_{timeframe}"
         for symbol in symbols
         for timeframe in INTERVALS
-    )
-    url = f"wss://fstream.binance.com/market/stream?streams={streams}"
+    ]
+    # Subscribe over a raw stream connection to avoid an oversized URL when
+    # scanning 400 kline streams (100 symbols x 4 intervals).
+    url = "wss://fstream.binance.com/ws"
 
     while True:
         try:
@@ -522,12 +524,21 @@ async def binance_signal_monitor(session, symbols):
                 open_timeout=20,
                 max_size=2**20,
             ) as websocket:
-                log.info("BINANCE FUTURES CONNECTED | symbols=%d | intervals=%s",
-                         len(symbols), ",".join(INTERVALS))
+                await websocket.send(json.dumps({
+                    "method": "SUBSCRIBE",
+                    "params": streams,
+                    "id": 1,
+                }))
+                log.info("BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | intervals=%s",
+                         len(symbols), len(streams), ",".join(INTERVALS))
 
                 async for raw in websocket:
                     packet = json.loads(raw)
-                    item = packet.get("data", {})
+                    # Raw /ws subscriptions return the event directly.
+                    # Ignore the subscription acknowledgement.
+                    if "id" in packet and "result" in packet:
+                        continue
+                    item = packet.get("data", packet)
                     kline = item.get("k")
                     if not kline or not kline.get("x"):
                         continue
