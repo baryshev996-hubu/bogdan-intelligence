@@ -44,7 +44,8 @@ def load_symbol(args):
                     history.clear()
             previous = ts
             o,h,l,c,v = map(float,row[1:6])
-            bar = dict(open_time=ts, close_time=ts+BAR-1, open=o, high=h, low=l, close=c, volume=v)
+            bar = dict(open_time=ts, close_time=ts+BAR-1, open=o, high=h, low=l, close=c, volume=v,
+                       taker_buy_volume=float(row[9]))
             histories["5m"].append(bar)
             for tf, width in (("15m",3*BAR),("1h",12*BAR)):
                 if ts % width == 0:

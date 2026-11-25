@@ -6,6 +6,8 @@ from collections import deque
 from datetime import datetime, timezone
 from statistics import mean
 
+from app.analyst import analyst_lines
+
 
 INTERVALS = ("5m", "15m", "1h")
 INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
@@ -243,6 +245,9 @@ def format_signal(signal):
         "Почему сигнал:",
     ]
     lines.extend(f"• {reason}" for reason in signal["reasons"])
+    lines.extend(analyst_lines(signal))
+    boundary = "или ниже" if side == "LONG" else "или выше"
+    lines.append(f"Сценарий отменён при цене {_fmt_price(signal['stop'])} {boundary}.")
     lines.extend([
         "",
         f"Свеча закрылась: {signal['candle_time']}",

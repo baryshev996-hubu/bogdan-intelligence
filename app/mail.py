@@ -20,6 +20,7 @@ if __name__ == "__main__":
     sys.modules["app.mail"] = sys.modules[__name__]
 
 from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, evaluate, format_signal
+from app.analyst import market_context
 from app.leverage import build_leverage_paper_signal
 from app.signal_delivery import queue_signal, deliver_signals
 from app.market_intel import run_market_intelligence
@@ -389,6 +390,7 @@ async def load_binance_history(session, symbol: str, interval: str, start=None, 
             "low": float(row[3]),
             "close": float(row[4]),
             "volume": float(row[5]),
+            "taker_buy_volume": float(row[9]) if len(row) > 9 else None,
             "close_time": int(row[6]),
         }
         if candle["close_time"] < now_ms:
@@ -629,6 +631,12 @@ async def binance_signal_monitor(session, symbols):
         signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
         if signal:
             scan_signals += 1
+            signal["market_context"] = market_context(
+                candle, histories[symbol]["1h"], histories.get("BTCUSDT", {}).get("1h", ())
+            )
+            context = signal["market_context"]
+            log.info("SIGNAL ANALYSIS | %s %s | buy_share=%s | btc_change=%s | relative=%s",
+                     signal["side"], symbol, context["buy_share"], context["btc_change"], context["relative"])
             await dispatch_signal(signal)
 
         if now_mono - last_scan_report >= 60:
@@ -681,6 +689,7 @@ async def binance_signal_monitor(session, symbols):
                         "low": float(row[3]),
                         "close": float(row[4]),
                         "volume": float(row[5]),
+                        "taker_buy_volume": float(row[9]) if len(row) > 9 else None,
                         "close_time": int(row[6]),
                     }
                     if candle["close_time"] >= now_ms or candle["open_time"] <= latest_open_time:
