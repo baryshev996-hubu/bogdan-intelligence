@@ -8,11 +8,9 @@ stop-first on ambiguous OHLC bars, fee+slippage, 12h time exit.
 import argparse
 import asyncio
 import json
-import math
 import statistics
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
 
 import aiohttp
 
@@ -30,6 +28,25 @@ INTERVAL_MS = 300_000
 FEE_RATE = 0.0005
 SLIPPAGE = 0.0001
 MAX_HOLD_BARS = 144
+
+
+async def fetch_top_symbols(session, count):
+    async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo") as response:
+        response.raise_for_status()
+        info = await response.json()
+    async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr") as response:
+        response.raise_for_status()
+        tickers = await response.json()
+    eligible = {
+        x["symbol"] for x in info["symbols"]
+        if x.get("status") == "TRADING" and x.get("contractType") == "PERPETUAL"
+        and x.get("quoteAsset") == "USDT"
+    }
+    ranked = sorted(
+        (x for x in tickers if x.get("symbol") in eligible),
+        key=lambda x: float(x.get("quoteVolume", 0)), reverse=True
+    )
+    return [x["symbol"] for x in ranked[:count]]
 
 
 async def fetch_klines(session, symbol, start_ms, end_ms, semaphore):
@@ -272,7 +289,7 @@ async def main():
             "fees_each_side": FEE_RATE, "slippage_each_side": SLIPPAGE,
             "timeframes": ["5m", "15m", "1h"], "closed_candles_only": True,
             "warning_rule": "block only when at least 2 of structure break, MACD fade, micro-structure shift agree",
-            "limitations": "Independent per-symbol trade streams; no portfolio-wide max-open or funding model. Research comparison, not a live performance guarantee."
+            "limitations": "Independent per-symbol trade streams; no portfolio-wide max-open constraint or funding-rate debits. Research comparison, not a live performance guarantee."
         }
     }
     with open(args.output, "w", encoding="utf-8") as f:
