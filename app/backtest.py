@@ -181,6 +181,9 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         if apply_reversal_filter:
             blocked, reason = _reversal_conflict(one_window, signal["side"])
             filter_reasons[reason] += 1
+            signal_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(as_of / 1000))
+            log.info("BACKTEST 1m CANDIDATE | %s | %s | %s | entry=%.6f | blocked=%s | %s",
+                     symbol, signal["side"], signal_time, signal["entry"], blocked, reason)
             if blocked:
                 blocked_signals += 1
                 index += 1
