@@ -143,7 +143,7 @@ def _reversal_conflict(candles, side):
         ) if flag]
         reason = "нисходящий разворот 1m: " + ", ".join(active)
 
-    return confirmed, reason if confirmed else "нет подтверждённого встречного движения 1m"
+    return confirmed, reason if active else "1m: ни один встречный признак не сработал"
 
 
 
