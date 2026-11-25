@@ -22,15 +22,19 @@ from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
 from app.upcoming_listings import run_upcoming_listings_monitor
 
-# Separate short sprint. 09:00 Kyiv time on 25 Nov 2026 = 07:00 UTC.
+# Isolated 10-hour sprint v2. Uses the baseline MTF setup without the
+# underperforming 1m reversal veto. Separate ledger; no effect on main PAPER.
+SPRINT_STARTED_AT = int(time.time())
+SPRINT_ENDS_AT = SPRINT_STARTED_AT + 10 * 60 * 60
 paper_sprint_book = PaperBook(
-    path="/data/paper_sprint_20261125.json",
+    path="/data/paper_sprint_v2_20261125.json",
     start_balance=100.0,
-    risk_fraction=0.01,
-    max_open=3,
+    risk_fraction=0.005,
+    max_open=2,
     max_gross_leverage=3.0,
-    ends_at=int(datetime(2026, 11, 25, 7, 0, tzinfo=timezone.utc).timestamp()),
-    label="09:00 sprint",
+    fee_rate=0.0005,
+    ends_at=SPRINT_ENDS_AT,
+    label="10-hour sprint v2",
 )
 
 # Isolated order-book PAPER challenge. Kyiv 20:00 on 25 Nov 2026 = 18:00 UTC.
@@ -392,11 +396,6 @@ async def binance_signal_monitor(session, symbols):
             opened = paper_book.open_trade(signal)
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
-        if paper_sprint_book.active():
-            sprint_opened = paper_sprint_book.open_trade(signal)
-            if sprint_opened:
-                log.info("PAPER SPRINT STATUS | %s", paper_sprint_book.status())
-
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
         if orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
@@ -513,6 +512,22 @@ async def binance_signal_monitor(session, symbols):
                     paper_sprint_book.on_candle(symbol, candle)
                     orderflow_paper_book.on_candle(symbol, candle)
 
+                    # The sprint tests the proven baseline MTF setup independently.
+                    # The main PAPER book keeps its existing 1m reversal filter.
+                    if paper_sprint_book.active():
+                        sprint_signal = evaluate(
+                            symbol, histories[symbol], apply_reversal_filter=False
+                        )
+                        if sprint_signal:
+                            sprint_signal = dict(sprint_signal)
+                            sprint_signal["paper_slippage_rate"] = 0.0001
+                            sprint_opened = paper_sprint_book.open_trade(sprint_signal)
+                            if sprint_opened:
+                                log.info(
+                                    "PAPER SPRINT V2 OPENED | %s %s | risk=0.50%% | slippage=0.010%% | status=%s",
+                                    sprint_signal["side"], symbol, paper_sprint_book.status()
+                                )
+
                     signal = evaluate(symbol, histories[symbol])
                     if signal:
                         await dispatch_signal(signal)
@@ -537,7 +552,8 @@ async def main():
     log.info("SIGNAL DELIVERY | enabled=%s | symbols=%d | %s",
              ENABLE_SIGNAL_DELIVERY, len(SIGNAL_DELIVERY_SYMBOLS), sorted(SIGNAL_DELIVERY_SYMBOLS))
     log.info("PAPER TRADING | %s", paper_book.status())
-    log.info("PAPER SPRINT | %s", paper_sprint_book.status())
+    log.info("PAPER SPRINT V2 | %s | risk=0.50%% | max_open=2 | leverage_cap=3x | ends_at=%s",
+             paper_sprint_book.status(), SPRINT_ENDS_AT)
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
 
