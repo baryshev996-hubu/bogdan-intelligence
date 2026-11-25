@@ -28,3 +28,5 @@ class ReversalFilterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+# Research branch trigger: rerun the isolated A/B workflow on this commit.
