@@ -33,6 +33,18 @@ paper_sprint_book = PaperBook(
     label="09:00 sprint",
 )
 
+# Isolated order-book PAPER challenge. Kyiv 20:00 on 25 Nov 2026 = 18:00 UTC.
+orderflow_paper_book = PaperBook(
+    path="/data/orderflow_paper_20261125.json",
+    start_balance=200.0,
+    risk_fraction=0.01,
+    max_open=2,
+    max_gross_leverage=20.0,
+    fee_rate=0.0005,
+    ends_at=int(datetime(2026, 11, 25, 18, 0, tzinfo=timezone.utc).timestamp()),
+    label="ORDERFLOW 200 USD challenge",
+)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -385,6 +397,39 @@ async def binance_signal_monitor(session, symbols):
             if sprint_opened:
                 log.info("PAPER SPRINT STATUS | %s", paper_sprint_book.status())
 
+        # Separate experiment: base signal must be confirmed by a fresh persistent
+        # order-book wall plus opposing aggressive taker flow (absorption).
+        if orderflow_paper_book.active():
+            from app.order_flow import get_order_flow_confirmation
+            flow = get_order_flow_confirmation(symbol, signal["side"], max_age=2.0)
+            if not flow or float(flow.get("strength", 0)) < 70:
+                log.info("ORDERFLOW PAPER SKIP | %s %s | no fresh aligned wall/absorption confirmation",
+                         signal["side"], symbol)
+            else:
+                entry = float(flow["mid"])
+                original_risk = abs(float(signal["entry"]) - float(signal["stop"]))
+                if entry > 0 and original_risk > 0:
+                    direction = 1.0 if signal["side"] == "LONG" else -1.0
+                    test_signal = dict(signal)
+                    test_signal["entry"] = entry
+                    test_signal["stop"] = entry - direction * original_risk
+                    test_signal["targets"] = [
+                        entry + direction * original_risk * 0.45,
+                        entry + direction * original_risk * 0.85,
+                        entry + direction * original_risk * 1.25,
+                    ]
+                    strength = float(flow["strength"])
+                    leverage = max(10, min(20, 10 + int((strength - 70) / 3)))
+                    test_signal["paper_max_gross_leverage"] = leverage
+                    opened = orderflow_paper_book.open_trade(test_signal)
+                    if opened:
+                        log.info("ORDERFLOW PAPER OPENED | %s %s | flow=%.1f | leverage_cap=%dx | wall=$%.0f | persistence=%.1fs | balance=%s",
+                                 signal["side"], symbol, strength, leverage,
+                                 float(flow["wall_usd"]), float(flow["persistence_sec"]),
+                                 orderflow_paper_book.status())
+                else:
+                    log.warning("ORDERFLOW PAPER SKIP | invalid entry/risk | %s", symbol)
+
         if not ENABLE_SIGNAL_DELIVERY:
             log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s", signal["side"], symbol)
             return
@@ -462,6 +507,7 @@ async def binance_signal_monitor(session, symbols):
 
                     paper_book.on_candle(symbol, candle)
                     paper_sprint_book.on_candle(symbol, candle)
+                    orderflow_paper_book.on_candle(symbol, candle)
 
                     signal = evaluate(symbol, histories[symbol])
                     if signal:
@@ -488,6 +534,8 @@ async def main():
              ENABLE_SIGNAL_DELIVERY, len(SIGNAL_DELIVERY_SYMBOLS), sorted(SIGNAL_DELIVERY_SYMBOLS))
     log.info("PAPER TRADING | %s", paper_book.status())
     log.info("PAPER SPRINT | %s", paper_sprint_book.status())
+
+    log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         await validate_telegram_auth(session)
