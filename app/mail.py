@@ -106,17 +106,20 @@ telegram_send_lock = asyncio.Lock()
 telegram_last_sent = 0.0
 telegram_auth_valid = None
 telegram_auth_checked_at = 0.0
+telegram_auth_lock = asyncio.Lock()
+telegram_hard_auth_failure = False
 TELEGRAM_AUTH_RECHECK_SECONDS = 300
 
 
 def refresh_telegram_token_from_environment() -> bool:
     """Pick up a rotated Railway variable after a process restart/reconfiguration."""
-    global BOT_TOKEN, telegram_auth_valid, telegram_auth_checked_at
+    global BOT_TOKEN, telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
     candidate = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if candidate and candidate != BOT_TOKEN:
         BOT_TOKEN = candidate
         telegram_auth_valid = None
         telegram_auth_checked_at = 0.0
+        telegram_hard_auth_failure = False
         log.warning("TELEGRAM TOKEN CHANGED | revalidating without logging the token")
         return True
     return False
@@ -124,41 +127,48 @@ def refresh_telegram_token_from_environment() -> bool:
 
 
 async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
-    """Validate token and remember the result. Never log the secret."""
-    global telegram_auth_valid, telegram_auth_checked_at
-    refresh_telegram_token_from_environment()
-    telegram_auth_checked_at = time.monotonic()
+    """Single-flight token validation with a hard circuit breaker for rejected credentials."""
+    global telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
 
-    if not BOT_TOKEN:
-        telegram_auth_valid = False
-        log.critical("TELEGRAM AUTH FAILED | TELEGRAM_BOT_TOKEN is empty")
-        return False
+    async with telegram_auth_lock:
+        refresh_telegram_token_from_environment()
+        if telegram_auth_valid is True:
+            return True
+        if telegram_hard_auth_failure:
+            return False
+        telegram_auth_checked_at = time.monotonic()
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-    try:
-        async with session.get(url, timeout=15) as response:
-            body = await response.json(content_type=None)
-            telegram_auth_valid = response.status == 200 and body.get("ok") is True
-            if telegram_auth_valid:
-                bot = body.get("result") or {}
-                log.info("TELEGRAM AUTH OK | bot_username=@%s", bot.get("username", "unknown"))
-            elif response.status == 401:
-                log.critical(
-                    "TELEGRAM AUTH INVALID (401) | token is rejected by Telegram. "
-                    "Automatic token regeneration is impossible. Replace TELEGRAM_BOT_TOKEN "
-                    "in Railway with a fresh BotFather token; the service will revalidate on restart."
-                )
-            else:
-                log.error("TELEGRAM AUTH CHECK FAILED | HTTP %s | %s",
-                          response.status, body.get("description", "unknown Telegram API error"))
-            return telegram_auth_valid
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        telegram_auth_valid = False
-        log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s",
-                  type(exc).__name__, str(exc)[:180])
-        return False
+        if not BOT_TOKEN:
+            telegram_auth_valid = False
+            telegram_hard_auth_failure = True
+            log.critical("TELEGRAM AUTH DISABLED | bot token is not configured")
+            return False
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+        try:
+            async with session.get(url, timeout=15) as response:
+                body = await response.json(content_type=None)
+                telegram_auth_valid = response.status == 200 and body.get("ok") is True
+                if telegram_auth_valid:
+                    bot = body.get("result") or {}
+                    log.info("TELEGRAM AUTH OK | bot_username=@%s", bot.get("username", "unknown"))
+                elif response.status == 401:
+                    telegram_hard_auth_failure = True
+                    log.critical(
+                        "TELEGRAM AUTH CIRCUIT OPEN | Telegram rejected the configured bot credential. "
+                        "All sends and automatic rechecks are stopped until the token is rotated."
+                    )
+                else:
+                    log.error("TELEGRAM AUTH CHECK FAILED | HTTP %s | %s",
+                              response.status, body.get("description", "unknown Telegram API error"))
+                return telegram_auth_valid
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            telegram_auth_valid = False
+            log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s",
+                      type(exc).__name__, str(exc)[:180])
+            return False
 
 
 async def telegram_auth_monitor(session: aiohttp.ClientSession) -> None:
@@ -167,8 +177,11 @@ async def telegram_auth_monitor(session: aiohttp.ClientSession) -> None:
         await asyncio.sleep(TELEGRAM_AUTH_RECHECK_SECONDS)
         token_changed = refresh_telegram_token_from_environment()
         stale = time.monotonic() - telegram_auth_checked_at >= TELEGRAM_AUTH_RECHECK_SECONDS
-        if token_changed or (telegram_auth_valid is not True and stale):
-            log.info("TELEGRAM AUTH RECOVERY CHECK | checking configured token")
+        if token_changed:
+            log.info("TELEGRAM AUTH RECOVERY CHECK | token rotation detected")
+            await validate_telegram_auth(session)
+        elif telegram_auth_valid is not True and not telegram_hard_auth_failure and stale:
+            log.info("TELEGRAM AUTH RECOVERY CHECK | retrying after transient failure")
             await validate_telegram_auth(session)
 
 
@@ -199,6 +212,13 @@ def is_allowed_telegram_alert(message: str) -> bool:
     if normalized.startswith("ORDER FLOW INTELLIGENCE |"):
         return True
 
+    if normalized.startswith("BOGDAN INTELLIGENCE | 🟢 FLOW CONFIRMED |"):
+        return True
+    if normalized.startswith("BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION |"):
+        return True
+    if normalized.startswith("BOGDAN INTELLIGENCE | ⚪ RAW FLOW, NO CONFIRMATION |"):
+        return True
+
     if normalized.startswith("🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING") or normalized.startswith("BOGDAN INTELLIGENCE | UPCOMING LISTING"):
         return True
 
@@ -207,7 +227,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
 
 async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
     """Send only allowlisted alerts, with serialization and bounded retries."""
-    global telegram_last_sent, telegram_auth_valid, telegram_auth_checked_at
+    global telegram_last_sent, telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
 
     if not is_allowed_telegram_alert(message):
         first_line = next((line.strip() for line in str(message).splitlines() if line.strip()), "<empty>")
@@ -274,10 +294,10 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
                     if response.status == 401:
                         telegram_auth_valid = False
                         telegram_auth_checked_at = time.monotonic()
+                        telegram_hard_auth_failure = True
                         log.critical(
-                            "TELEGRAM SEND AUTH FAILED (401) | token rejected. "
-                            "Stopped all further sends to prevent retry storms. "
-                            "A fresh BotFather token must be saved as TELEGRAM_BOT_TOKEN in Railway."
+                            "TELEGRAM AUTH CIRCUIT OPEN | send endpoint rejected the configured credential. "
+                            "Queued sends are blocked and automatic retries are disabled until token rotation."
                         )
                         return False
 
