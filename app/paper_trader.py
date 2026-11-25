@@ -104,7 +104,8 @@ class PaperBook:
         qty = risk_budget / distance
         current_gross = sum(float(t["remaining"]) * float(t["entry"])
                             for t in self.state["open_trades"].values())
-        max_gross = equity * self.max_gross_leverage
+        leverage_cap = float(signal.get("paper_max_gross_leverage", self.max_gross_leverage))
+        max_gross = equity * min(self.max_gross_leverage, max(1.0, leverage_cap))
         remaining_capacity = max(0.0, max_gross - current_gross)
         qty = min(qty, remaining_capacity / entry)
         notional = qty * entry
@@ -120,6 +121,7 @@ class PaperBook:
             "entry_fee": fee, "exit_fees": 0.0, "gross_realized": 0.0,
             "tp1": False, "tp2": False, "opened_at": _now(),
             "signal_confidence": int(signal.get("confidence", 0)),
+            "paper_leverage_cap": min(self.max_gross_leverage, max(1.0, float(signal.get("paper_max_gross_leverage", self.max_gross_leverage)))),
             "entry_time": int(signal.get("entry_time", signal.get("candle_id", 0)) or 0),
             "management_version": 2,
             "risk_distance": distance,
@@ -128,8 +130,9 @@ class PaperBook:
             "tp3_qty": qty * (1.0 - TP1_FRACTION - TP2_FRACTION),
         }
         self._save_data()
-        log.info("PAPER OPEN | %s %s entry=%.8f stop=%.8f qty=%.8f notional=$%.2f risk=$%.2f fee=$%.4f plan=70%%@0.8R/20%%@1.5R/10%%@2.2R",
-                 signal["side"], symbol, entry, stop, qty, notional, risk_budget, fee)
+        log.info("PAPER OPEN | %s %s entry=%.8f stop=%.8f qty=%.8f notional=$%.2f effective_leverage=%.2fx risk=$%.2f fee=$%.4f targets=%s",
+                 signal["side"], symbol, entry, stop, qty, notional, notional / equity,
+                 risk_budget, fee, signal["targets"])
         return True
 
     def _exit_qty(self, trade, price, qty, reason):
@@ -153,6 +156,11 @@ class PaperBook:
         trade = self.state["open_trades"].get(symbol)
         if not trade:
             self._maybe_finish()
+            return
+        if not self.active():
+            close = float(candle["close"])
+            self._exit(trade, close, 1.0, "CHALLENGE_END")
+            self._close_trade(symbol, "CHALLENGE_END")
             return
         # A 5m candle that began before a delayed 1m-confirmed entry must not
         # manage the new position using price action from before the entry.
