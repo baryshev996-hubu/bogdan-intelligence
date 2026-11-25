@@ -16,7 +16,7 @@ on:
         required: false
         default: "60"
       universe:
-        description: "30 configured liquid pairs or top 100 USDT perpetuals"
+        description: "30 configured liquid USDT perpetual pairs"
         required: false
         default: "30"
 
