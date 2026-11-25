@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import aiohttp
 
-from app.signal_engine import INTERVALS, evaluate, _reversal_conflict
+from app.signal_engine import INTERVALS, evaluate, confirm_signal_with_1m
 
 
 log = logging.getLogger("bogdan-backtest")
@@ -72,7 +72,7 @@ async def fetch_candles(session, symbol, interval):
     return [unique[key] for key in sorted(unique)]
 
 
-def simulate_trade(signal, future_candles):
+def simulate_trade(signal, future_candles, horizon_bars=HORIZON_BARS):
     """Mirror the live paper exit plan: 70% at 0.8R, 20% at 1.5R,
     then trail the final 10%; 2.2R is an optional full runner exit.
     Conservative same-candle ordering assumes the active stop fills first.
@@ -95,7 +95,7 @@ def simulate_trade(signal, future_candles):
     trail_buffer = 0.15 * risk
     lock_profit = 0.10 * risk
 
-    for index, candle in enumerate(future_candles[:HORIZON_BARS]):
+    for index, candle in enumerate(future_candles[:horizon_bars]):
         stop_hit = (candle["low"] <= active_stop if side == "LONG"
                     else candle["high"] >= active_stop)
         if stop_hit:
@@ -131,10 +131,10 @@ def simulate_trade(signal, future_candles):
             else:
                 active_stop = min(active_stop, candle["high"] + trail_buffer)
 
-    last_price = future_candles[min(len(future_candles), HORIZON_BARS) - 1]["close"]
+    last_price = future_candles[min(len(future_candles), horizon_bars) - 1]["close"]
     direction = 1.0 if side == "LONG" else -1.0
     realized_r += remaining * direction * (last_price - entry) / risk
-    return realized_r, min(len(future_candles), HORIZON_BARS) - 1
+    return realized_r, min(len(future_candles), horizon_bars) - 1
 
 
 def backtest_symbol(symbol, data, apply_reversal_filter=True):
@@ -156,7 +156,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
     last_signal = None
     index = 59
 
-    while index < len(five) - 1:
+    while index < len(five) - 2:
         candle = five[index]
         as_of = candle["close_time"]
         j1 = bisect.bisect_right(close1, as_of)
@@ -178,31 +178,54 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
             continue
 
         candidate_signals += 1
+        signal_time = as_of
         if apply_reversal_filter:
-            blocked, reason = _reversal_conflict(one_window, signal["side"])
-            filter_reasons[reason] += 1
-            signal_time = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(as_of / 1000))
-            log.info("BACKTEST 1m CANDIDATE | %s | %s | %s | entry=%.6f | blocked=%s | %s",
-                     symbol, signal["side"], signal_time, signal["entry"], blocked, reason)
-            if blocked:
+            # Wait for the first fully closed 1m candle after the 5m setup.
+            if j1 >= len(one) or j1 + 5 > len(one):
                 blocked_signals += 1
+                filter_reasons["no complete post-signal 1m window"] += 1
                 index += 1
                 continue
+            confirmation_candle = one[j1]
+            confirmed_signal = confirm_signal_with_1m(signal, confirmation_candle)
+            confirm_time = confirmation_candle["close_time"]
+            confirm_label = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(confirm_time / 1000))
+            if not confirmed_signal:
+                blocked_signals += 1
+                filter_reasons["next 1m candle did not confirm direction"] += 1
+                log.info("BACKTEST 1m CONFIRM | %s | %s | %s | rejected | open=%.6f close=%.6f entry=%.6f",
+                         symbol, signal["side"], confirm_label,
+                         confirmation_candle["open"], confirmation_candle["close"], signal["entry"])
+                index += 1
+                continue
+            signal = confirmed_signal
+            signal_time = confirm_time
+            filter_reasons["next 1m candle confirmed direction"] += 1
+            log.info("BACKTEST 1m CONFIRM | %s | %s | %s | accepted | entry=%.6f",
+                     symbol, signal["side"], confirm_label, signal["entry"])
 
         if last_signal:
             cooldown = (SAME_SIDE_COOLDOWN_MS
                         if last_signal["side"] == signal["side"]
                         else FLIP_COOLDOWN_MS)
-            if as_of - last_signal["time"] < cooldown:
+            if signal_time - last_signal["time"] < cooldown:
                 index += 1
                 continue
 
-        future = five[index + 1:index + 1 + HORIZON_BARS]
-        gross_r, exit_offset = simulate_trade(signal, future)
+        if apply_reversal_filter:
+            # The first 1m candle confirmed the entry. Simulate the remaining
+            # four minutes of that 5m bar at 1m resolution, then resume 5m bars.
+            future_1m = one[j1 + 1:j1 + 5]
+            future_5m = five[index + 2:index + 2 + (HORIZON_BARS - 1)]
+            future = future_1m + future_5m
+            gross_r, exit_offset = simulate_trade(signal, future, horizon_bars=len(future))
+        else:
+            future = five[index + 1:index + 1 + HORIZON_BARS]
+            gross_r, exit_offset = simulate_trade(signal, future)
+
         if gross_r is None:
             break
 
-        # Approximate round-trip taker fees and slippage, configurable per environment.
         cost_fraction = 2 * (TAKER_FEE_RATE + SLIPPAGE_RATE)
         cost_r = cost_fraction * signal["entry"] / abs(signal["entry"] - signal["stop"])
         net_r = gross_r - cost_r
@@ -210,10 +233,13 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
             "side": signal["side"],
             "gross_r": gross_r,
             "net_r": net_r,
-            "time": as_of,
+            "time": signal_time,
         })
-        last_signal = {"side": signal["side"], "time": as_of}
-        index += exit_offset + 2
+        last_signal = {"side": signal["side"], "time": signal_time}
+        if apply_reversal_filter:
+            index += 2 if exit_offset < 4 else exit_offset - 1
+        else:
+            index += exit_offset + 2
 
     return {
         "trades": results,
