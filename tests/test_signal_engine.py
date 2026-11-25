@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi, _reversal_conflict, confirm_signal_with_1m
+from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi, _reversal_conflict, confirm_signal_with_1m, confirm_signal_with_1m_window
 from app.backtest import simulate_trade
 
 
@@ -91,6 +91,38 @@ class SignalEngineTests(unittest.TestCase):
         self.assertAlmostEqual(confirmed["entry"], 100.2)
         self.assertAlmostEqual(confirmed["stop"], 98.2)
         self.assertAlmostEqual(confirmed["targets"][0], 102.2)
+
+    def test_two_bullish_1m_candles_veto_short(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candles = [
+            {"open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1, "close_time": 100000},
+            {"open": 100.1, "high": 100.4, "low": 100.0, "close": 100.3, "close_time": 160000},
+        ]
+        self.assertIsNone(confirm_signal_with_1m_window(signal, candles))
+
+    def test_mixed_1m_candles_allow_short(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candles = [
+            {"open": 100.0, "high": 100.2, "low": 99.9, "close": 100.1, "close_time": 100000},
+            {"open": 100.1, "high": 100.2, "low": 99.8, "close": 99.9, "close_time": 160000},
+        ]
+        confirmed = confirm_signal_with_1m_window(signal, candles)
+        self.assertIsNotNone(confirmed)
+        self.assertEqual(confirmed["entry_time"], 160000)
+
+    def test_two_bearish_1m_candles_veto_long(self):
+        signal = {"side": "LONG", "entry": 100.0, "stop": 98.0,
+                  "targets": [102.0, 103.0, 105.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candles = [
+            {"open": 100.0, "high": 100.1, "low": 99.8, "close": 99.9, "close_time": 100000},
+            {"open": 99.9, "high": 100.0, "low": 99.6, "close": 99.7, "close_time": 160000},
+        ]
+        self.assertIsNone(confirm_signal_with_1m_window(signal, candles))
 
     def test_confirmed_upward_reversal_blocks_short(self):
         candles = []
