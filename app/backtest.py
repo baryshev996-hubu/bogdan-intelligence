@@ -7,7 +7,6 @@ import logging
 import os
 import time
 import bisect
-from collections import defaultdict
 
 import aiohttp
 
@@ -237,7 +236,7 @@ async def main():
             datasets[symbol] = data
 
     baseline = {symbol: backtest_symbol(symbol, data) for symbol, data in datasets.items()}
-    report(baseline, label="BASELINE WITHOUT 1m")
+    report(baseline, label="MTF BASELINE 5m 15m 1h")
 
 
 if __name__ == "__main__":
