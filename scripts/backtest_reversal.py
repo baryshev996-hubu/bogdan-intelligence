@@ -7,12 +7,16 @@ stop-first on ambiguous OHLC bars, fee+slippage, 12h time exit.
 """
 import argparse
 import asyncio
+import csv
+import io
 import json
 import statistics
 import time
 import sys
+import zipfile
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 
@@ -53,6 +57,59 @@ async def fetch_top_symbols(session, count):
     return [x["symbol"] for x in ranked[:count]]
 
 
+async def fetch_archive_zip(session, url, semaphore):
+    async with semaphore:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            if response.status == 404:
+                return []
+            response.raise_for_status()
+            payload = await response.read()
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        name = next((n for n in archive.namelist() if n.lower().endswith(".csv")), None)
+        if not name:
+            return []
+        rows = csv.reader(io.StringIO(archive.read(name).decode("utf-8-sig")))
+        output = []
+        for row in rows:
+            if not row or not row[0].strip().lstrip("-").isdigit():
+                continue
+            output.append({
+                "open_time": int(row[0]), "open": float(row[1]), "high": float(row[2]),
+                "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]),
+                "close_time": int(row[6]),
+            })
+        return output
+
+
+async def fetch_archive_klines(session, symbol, start_ms, end_ms, semaphore):
+    start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    current_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    tasks = []
+    month = start
+    while month < min(end, current_month):
+        url = (f"https://data.binance.vision/data/futures/um/monthly/klines/{symbol}/5m/"
+               f"{symbol}-5m-{month:%Y-%m}.zip")
+        tasks.append(fetch_archive_zip(session, url, semaphore))
+        month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    daily_start = max(start, current_month)
+    day = daily_start.date()
+    last_complete_day = (end - timedelta(days=1)).date()
+    while day <= last_complete_day:
+        url = (f"https://data.binance.vision/data/futures/um/daily/klines/{symbol}/5m/"
+               f"{symbol}-5m-{day:%Y-%m-%d}.zip")
+        tasks.append(fetch_archive_zip(session, url, semaphore))
+        day += timedelta(days=1)
+    batches = await asyncio.gather(*tasks, return_exceptions=True)
+    rows = []
+    for batch in batches:
+        if isinstance(batch, Exception):
+            raise batch
+        rows.extend(batch)
+    rows.sort(key=lambda x: x["open_time"])
+    return [x for x in rows if start_ms <= x["open_time"] <= end_ms]
+
+
 async def fetch_klines(session, symbol, start_ms, end_ms, semaphore):
     rows, cursor = [], start_ms
     while cursor < end_ms:
@@ -68,6 +125,8 @@ async def fetch_klines(session, symbol, start_ms, end_ms, semaphore):
                         if response.status in (418, 429):
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
+                        if response.status == 451:
+                            return await fetch_archive_klines(session, symbol, start_ms, end_ms, semaphore)
                         response.raise_for_status()
                         batch = await response.json()
                         break
