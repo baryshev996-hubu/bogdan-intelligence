@@ -94,49 +94,46 @@ def _trend(candles):
 
 
 def _reversal_conflict(candles, side):
-    """Block entries only when multiple closed-1m signals confirm a counter-trend move."""
+    """Detect a counter-trend 1m turn using fast EMA, momentum, structure and volume."""
     if len(candles) < 30:
         return True, "недостаточно 1m истории"
 
     closes = [c["close"] for c in candles]
-    recent = candles[-8:]
-    prior = candles[-6:-1]
     last = candles[-1]
-    e9, e21 = ema(closes, 9), ema(closes, 21)
-    if e9 is None or e21 is None:
+    e5, e13 = ema(closes, 5), ema(closes, 13)
+    if e5 is None or e13 is None:
         return True, "недостаточно 1m индикаторов"
+
+    recent_closes = closes[-5:]
+    rising_steps = sum(recent_closes[i] > recent_closes[i - 1] for i in range(1, 5))
+    falling_steps = sum(recent_closes[i] < recent_closes[i - 1] for i in range(1, 5))
+    current_rsi = rsi(closes, 14)
 
     avg_volume = mean(c["volume"] for c in candles[-21:-1])
     candle_range = max(last["high"] - last["low"], last["close"] * 1e-9)
     body_ratio = abs(last["close"] - last["open"]) / candle_range
     volume_impulse = avg_volume > 0 and last["volume"] >= 1.15 * avg_volume and body_ratio >= 0.55
 
-    higher_lows = sum(recent[i]["low"] > recent[i - 1]["low"] for i in range(1, len(recent))) >= 4
-    lower_highs = sum(recent[i]["high"] < recent[i - 1]["high"] for i in range(1, len(recent))) >= 4
-    current_rsi = rsi(closes, 14)
-    previous_rsi = rsi(closes[:-1], 14)
-
+    prior = candles[-4:-1]
     if side == "SHORT":
         confirmations = {
-            "EMA 1m разворачивается вверх": last["close"] > e9 and e9 > e21,
-            "пробит локальный максимум 1m": last["close"] > max(c["high"] for c in prior),
-            "формируются повышающиеся минимумы": higher_lows,
-            "RSI 1m усиливает покупателей": current_rsi is not None and previous_rsi is not None and current_rsi >= 55 and previous_rsi >= 52 and current_rsi > previous_rsi,
-            "сильная бычья свеча с объёмом": last["close"] > last["open"] and volume_impulse,
+            "быстрые EMA 1m направлены вверх": last["close"] > e5 and e5 > e13,
+            "последние 1m свечи показывают рост": rising_steps >= 3 and current_rsi is not None and current_rsi > 50,
+            "цена пробила максимум последних 3 минут": last["close"] > max(c["high"] for c in prior),
+            "бычий импульс подтверждён объёмом": last["close"] > last["open"] and volume_impulse,
         }
         reason = "восходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
     else:
         confirmations = {
-            "EMA 1m разворачивается вниз": last["close"] < e9 and e9 < e21,
-            "пробит локальный минимум 1m": last["close"] < min(c["low"] for c in prior),
-            "формируются понижающиеся максимумы": lower_highs,
-            "RSI 1m усиливает продавцов": current_rsi is not None and previous_rsi is not None and current_rsi <= 45 and previous_rsi <= 48 and current_rsi < previous_rsi,
-            "сильная медвежья свеча с объёмом": last["close"] < last["open"] and volume_impulse,
+            "быстрые EMA 1m направлены вниз": last["close"] < e5 and e5 < e13,
+            "последние 1m свечи показывают снижение": falling_steps >= 3 and current_rsi is not None and current_rsi < 50,
+            "цена пробила минимум последних 3 минут": last["close"] < min(c["low"] for c in prior),
+            "медвежий импульс подтверждён объёмом": last["close"] < last["open"] and volume_impulse,
         }
         reason = "нисходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
 
     confirmed = sum(bool(value) for value in confirmations.values()) >= 2
-    return confirmed, reason if confirmed else "нет двух независимых подтверждений разворота 1m"
+    return confirmed, reason if confirmed else "нет двух подтверждений разворота 1m"
 
 
 
