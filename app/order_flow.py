@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
+from html import escape
 
 import websockets
 
@@ -39,6 +40,54 @@ def _fmt_price(value):
 
 def _fmt_usd(value):
     return "$" + format(value, ",.0f")
+
+
+def format_order_flow_alert(symbol, side, level, notional, distance, age, buy_usd, sell_usd):
+    """Format a possible absorption event without implying a trade entry."""
+    bid = side == "BID"
+    context = "LONG" if bid else "SHORT"
+    icon = "🟢" if bid else "🔴"
+    wall = "BID-СТЕНА" if bid else "ASK-СТЕНА"
+    absorption = "продаж" if bid else "покупок"
+    total = buy_usd + sell_usd
+    separator = "━━━━━━━━━━━━━━━━━━"
+    lines = [
+        f"🧭 ORDER FLOW INTELLIGENCE | {escape(str(symbol))}",
+        "",
+        f"<b>{escape(str(symbol))} | ORDER FLOW</b>",
+        f"🟡 {wall} + возможное поглощение {absorption}",
+        f"{icon} <b>{context}-КОНТЕКСТ</b>",
+        separator,
+        "<i>ОБЪЁМ ЛИМИТНОЙ ЗАЯВКИ</i>",
+        f"<b>{_fmt_usd(notional)}</b>",
+        f"📍 Уровень: <code>{_fmt_price(level)}</code>",
+        f"Расстояние до цены: {distance:.3f}%",
+        f"В стакане: {age:.1f} сек.",
+        separator,
+        f"📊 <b>Агрессивные исполнения · {FLOW_WINDOW}с</b>",
+        f"🟢 BUY: <b>{_fmt_usd(buy_usd)}</b>",
+        f"🔴 SELL: <b>{_fmt_usd(sell_usd)}</b>",
+    ]
+    if total > 0:
+        share = 100 * buy_usd / total
+        blocks = max(0, min(10, int(share / 10 + 0.5)))
+        lines.extend([
+            "🟩" * blocks + "🟥" * (10 - blocks),
+            f"Покупки {share:.1f}% | Продажи {100-share:.1f}%",
+        ])
+    lines.extend([
+        separator,
+        "🧠 <b>Интерпретация рынка</b>",
+        ("Покупатели удерживают наблюдаемый BID-уровень на фоне агрессивных продаж."
+         if bid else "Продавцы удерживают наблюдаемый ASK-уровень на фоне агрессивных покупок."),
+        f"🟡 Возможное поглощение {absorption}. Разворот цены не подтверждён.",
+        "",
+        "⚠️ Дождаться реакции цены и подтверждения структуры. Не входить только по стене.",
+        separator,
+        "<i>Binance USDⓈ-M Futures | Стакан + исполнения</i>",
+        "<i>Режим: наблюдение, не торговый сигнал.</i>",
+    ])
+    return "\n".join(lines)
 
 
 def _levels(rows):
@@ -190,17 +239,9 @@ async def run_order_flow_monitor(session, symbols):
                         state["watch_sent"] = True
                         state["flow_sent"] = True
                         state["alerted_at"] = now
-                        await _send(session,
-                            "🧭 ORDER FLOW INTELLIGENCE | " + symbol + "\n"
-                            + "Событие: " + ("BID-СТЕНА + ПОГЛОЩЕНИЕ ПРОДАЖ" if side == "BID" else "ASK-СТЕНА + ПОГЛОЩЕНИЕ ПОКУПОК") + "\n"
-                            + "Уровень: " + _fmt_price(key[2]) + "\n"
-                            + "Объём заявки: " + _fmt_usd(notional) + "\n"
-                            + "Расстояние до цены: " + format(distance, ".3f") + "%\n"
-                            + "В стакане держится: " + format(age, ".1f") + " сек.\n"
-                            + "Оценка: " + action
-                            + confirmation
-                            + "\nУсловие: дождаться реакции цены и подтверждения структуры. Не входить только по стене."
-                        )
+                        await _send(session, format_order_flow_alert(
+                            symbol, side, key[2], notional, distance, age, buy_usd, sell_usd
+                        ))
 
                     # Publish a fresh side-specific snapshot for the isolated PAPER experiment.
                     buy_usd = sum(v for ts, taker, v in trades[symbol] if taker == "BUY")
