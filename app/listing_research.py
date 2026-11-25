@@ -82,12 +82,32 @@ async def _investor_research(session, name):
     return sorted(investors)[:8]
 
 
+def official_funding_excerpt(event):
+    """Keep an explicit source excerpt, not an inferred investor relationship."""
+    source = str(event.get("official_text") or "")
+    if not source:
+        return None
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", source):
+        sentence = " ".join(sentence.split())
+        if 15 <= len(sentence) <= 400 and re.search(
+                r"\b(?:backed by|investors include|investors are|funding round led by|investment led by)\b",
+                sentence, re.I):
+            # Reject generic promotional language and ambiguous disclaimers.
+            if not re.search(r"\b(?:not|may|could|rumor|rumour|unconfirmed)\b", sentence, re.I):
+                return sentence
+    return None
+
+
 async def research_token(session, event):
     cache_key = (event.get("ticker"), event.get("title"))
     previous = CACHE.get(cache_key)
     if previous and time.monotonic() - previous[0] < 3600:
         return previous[1]
     result = {"status": "н/д: нет подтверждённых фундаментальных данных"}
+    excerpt = official_funding_excerpt(event)
+    if excerpt:
+        result["official_funding_excerpt"] = excerpt
+        result["official_funding_url"] = event.get("url", "")
     headers = {"Accept": "application/json"}
     key = os.getenv("COINGECKO_DEMO_API_KEY", "").strip()
     if key:
@@ -146,6 +166,11 @@ def format_research(result):
     ]
     investors = result.get("investors") or []
     lines.append("Инвесторы: " + (e(", ".join(investors)) + " (DefiLlama, совпадение по названию; требуется сверка)" if investors else "н/д; не подтверждены"))
+    if result.get("official_funding_excerpt"):
+        lines.append("Финансирование (цитата из объявления, проверить контекст): " + e(result["official_funding_excerpt"]))
+        lines.append("Источник: " + e(result.get("official_funding_url", "")))
+    elif not investors:
+        lines.append("База раундов: https://defillama.com/raises (автоматический доступ требует API-плана).")
     if result.get("coin_id"):
         lines.append("CoinGecko: https://www.coingecko.com/en/coins/" + quote(str(result["coin_id"]), safe=""))
     if investors:

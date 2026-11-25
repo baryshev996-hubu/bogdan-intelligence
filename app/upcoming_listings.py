@@ -11,6 +11,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,6 +31,7 @@ EXCLUDED = (
     "leveraged token", " etf", "delist", "removal of", "will remove", "margin trading", "earn", "convert",
     "launchpool", "launchpool subscription", "equity", "equities", "stock",
     "commodity", "commodities", "forex", "precious metal", "pre-market equity",
+    "bstocks", "tokenized securities", "stock options", "trading competition", "trading bots",
 )
 
 LISTING_WORDS = ("will list", "new listing", "spot trading", "spot listing", "listing of", "perpetual", "futures", "swap")
@@ -161,7 +163,7 @@ async def _binance_listing_page(session):
     return list(found.values())
 
 
-async def _binance_listings(session):
+async def _binance_cms_listings(session):
     url = "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query"
     articles = []
     try:
@@ -253,8 +255,127 @@ async def _binance_listings(session):
                 "when": when,
                 "url": detail_url,
                 "source": "Binance official announcement",
+                "official_text": detail_text[:12000],
             })
     return out
+
+class _TelegramAnnouncementParser(HTMLParser):
+    """Extract only message bodies, not navigation, footers or unrelated links."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.depth = 0
+        self.current = None
+        self.messages = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if self.current is None:
+            if tag == "div" and "tgme_widget_message_text" in attrs.get("class", "").split():
+                self.current = {"parts": [], "links": []}
+                self.depth = 1
+            return
+        if tag == "div":
+            self.depth += 1
+        if tag == "br":
+            self.current["parts"].append("\n")
+        if tag == "a":
+            href = attrs.get("href", "")
+            if re.fullmatch(r"https://www\.binance\.com/[a-zA-Z-]+/support/announcement/(?:detail/)?[a-fA-F0-9]{32}/?(?:\?[^#]*)?", href):
+                self.current["links"].append(href)
+        if tag in ("p", "b", "strong"):
+            self.current["parts"].append("\n")
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current["parts"].append(data)
+
+    def handle_endtag(self, tag):
+        if self.current is None:
+            return
+        if tag in ("p", "b", "strong"):
+            self.current["parts"].append("\n")
+        if tag == "div":
+            self.depth -= 1
+            if self.depth == 0:
+                self.messages.append(self.current)
+                self.current = None
+
+
+def _telegram_listing_events(page):
+    parser = _TelegramAnnouncementParser()
+    parser.feed(page)
+    if not parser.messages:
+        raise RuntimeError("Official Telegram announcement page contains no message bodies")
+    out = []
+    for message in parser.messages:
+        raw = "".join(message["parts"])
+        lines = [_clean(line) for line in raw.splitlines() if _clean(line)]
+        if not lines or not message["links"]:
+            continue
+        title = lines[0]
+        # Require a new trading launch, not an update, a campaign or a delisting.
+        if not re.search(r"\b(?:will list|will launch|new listing|will open trading)\b", title, re.I):
+            continue
+        if any(word in title.lower() for word in ("multiple", "quarterly", "delivery contract", "pre-market", "pre market")):
+            continue
+        if any(word in raw.lower() for word in ("bstocks", "tradfi", "tokenized securities", "tokenised securities", "stock options")):
+            continue
+        market_type = _market_type(title)
+        ticker = _extract_ticker(title)
+        if not market_type or not ticker or excluded_ticker(ticker):
+            continue
+        # Reject multiple explicit symbols in a single notice, where times can differ.
+        pairs = set(re.findall(r"\b([A-Z0-9]{2,15})\s*/?\s*(?:USDT|USDC)\b", title))
+        if len(pairs) > 1:
+            continue
+        when = None
+        for line in lines[1:]:
+            if re.search(r"\b(?:trad(?:e|ing)|launch|list(?:ing)?|open)\b", line, re.I):
+                when = _parse_explicit_utc(line)
+                if when:
+                    break
+        if not when:
+            continue
+        link = message["links"][0].split("?")[0].rstrip("/")
+        article_id = link.rsplit("/", 1)[-1].lower()
+        out.append(dict(id="binance:" + article_id, exchange="Binance", title=title,
+                        market_type=market_type, ticker=ticker, when=when, url=link,
+                        source="Binance official Telegram announcement",
+                        official_text=raw[:12000]))
+    return out, len(parser.messages)
+
+
+async def _binance_telegram_listings(session):
+    url = "https://t.me/s/binance_announcements"
+    async with session.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"}, timeout=15) as response:
+        response.raise_for_status()
+        page = await response.text()
+    events, posts = _telegram_listing_events(page)
+    log.info("BINANCE OFFICIAL TELEGRAM OK | posts=%d | events=%d", posts, len(events))
+    return events
+
+
+async def _binance_listings(session):
+    # Independent sources: one failure must not discard successful results.
+    batches = await asyncio.gather(_binance_telegram_listings(session),
+                                   _binance_cms_listings(session), return_exceptions=True)
+    combined = {}
+    success = 0
+    for name, batch in zip(("Telegram", "CMS/HTML"), batches):
+        if isinstance(batch, asyncio.CancelledError):
+            raise batch
+        if isinstance(batch, Exception):
+            log.warning("BINANCE ANNOUNCEMENT SOURCE DEGRADED | %s | %s", name, type(batch).__name__)
+            continue
+        success += 1
+        for event in batch:
+            if event["id"] not in combined:
+                combined[event["id"]] = event
+    if not success:
+        raise RuntimeError("All Binance announcement sources failed")
+    log.info("BINANCE ANNOUNCEMENT COVERAGE | sources=%d/2 | events=%d", success, len(combined))
+    return list(combined.values())
+
 
 async def _bybit_listings(session):
     data = await _json_get(
@@ -277,6 +398,7 @@ async def _bybit_listings(session):
             "exchange": "Bybit", "title": title, "market_type": market_type, "ticker": _extract_ticker(title + " " + description),
             "when": when, "url": item.get("url") or "https://announcements.bybit.com/",
             "source": "Bybit official announcement",
+            "official_text": description[:12000],
         })
     return out
 
