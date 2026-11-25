@@ -20,7 +20,7 @@ SYMBOLS = [s.strip().upper() for s in os.getenv(
 ).split(",") if s.strip()]
 LIMIT = 1500
 LOOKBACK_DAYS = 45
-INTERVAL_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}
+INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 HORIZON_BARS = 144  # 12 hours of 5m candles
 SAME_SIDE_COOLDOWN_MS = 6 * 60 * 60 * 1000
 FLIP_COOLDOWN_MS = 60 * 60 * 1000
@@ -137,14 +137,16 @@ def simulate_trade(signal, future_candles):
     return realized_r, min(len(future_candles), HORIZON_BARS) - 1
 
 
-def backtest_symbol(symbol, data):
+def backtest_symbol(symbol, data, apply_reversal_filter=True):
     five = data["5m"]
     fifteen = data["15m"]
     hourly = data["1h"]
-    if min(len(five), len(fifteen), len(hourly)) < 100:
+    one = data.get("1m", [])
+    if min(len(five), len(fifteen), len(hourly)) < 100 or (apply_reversal_filter and len(one) < 100):
         log.warning("%s: insufficient historical candles, skipping", symbol)
         return []
 
+    close1 = [c["close_time"] for c in one]
     close15 = [c["close_time"] for c in fifteen]
     close1h = [c["close_time"] for c in hourly]
     results = []
@@ -154,17 +156,19 @@ def backtest_symbol(symbol, data):
     while index < len(five) - 1:
         candle = five[index]
         as_of = candle["close_time"]
+        j1 = bisect.bisect_right(close1, as_of)
         j15 = bisect.bisect_right(close15, as_of)
         j1h = bisect.bisect_right(close1h, as_of)
-        if j15 < 60 or j1h < 60:
+        if j15 < 60 or j1h < 60 or (apply_reversal_filter and j1 < 24):
             index += 1
             continue
 
         signal = evaluate(symbol, {
+            "1m": one[max(0, j1 - 240):j1],
             "5m": five[max(0, index + 1 - 240):index + 1],
             "15m": fifteen[max(0, j15 - 240):j15],
             "1h": hourly[max(0, j1h - 240):j1h],
-        }, as_of_ms=as_of)
+        }, as_of_ms=as_of, apply_reversal_filter=apply_reversal_filter)
         if not signal:
             index += 1
             continue
@@ -198,10 +202,10 @@ def backtest_symbol(symbol, data):
     return results
 
 
-def report(all_results):
+def report(all_results, label="FILTERED"):
     trades = [trade for rows in all_results.values() for trade in rows]
     if not trades:
-        log.info("BACKTEST: no qualifying signals in the loaded sample.")
+        log.info("BACKTEST %s: no qualifying signals in the loaded sample.", label)
         return
 
     wins = [t["net_r"] for t in trades if t["net_r"] > 0]
@@ -219,9 +223,9 @@ def report(all_results):
     log.info("BACKTEST COSTS | taker_fee_each_side=%.3f%% slippage_each_side=%.3f%%; funding excluded",
              TAKER_FEE_RATE * 100, SLIPPAGE_RATE * 100)
     log.info(
-        "BACKTEST | trades=%s wins=%s losses=%s win_rate=%.1f%% "
+        "BACKTEST %s | trades=%s wins=%s losses=%s win_rate=%.1f%% "
         "avg_net_R=%.3f total_net_R=%.2f profit_factor=%.2f max_drawdown_R=%.2f",
-        len(trades), len(wins), len(losses), 100 * len(wins) / len(trades),
+        label, len(trades), len(wins), len(losses), 100 * len(wins) / len(trades),
         avg_r, total_r, profit_factor, max_drawdown
     )
     for symbol, rows in all_results.items():
@@ -242,7 +246,7 @@ def report(all_results):
 async def main():
     timeout = aiohttp.ClientTimeout(total=45)
     connector = aiohttp.TCPConnector(limit=12)
-    all_results = defaultdict(list)
+    datasets = {}
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         for symbol in SYMBOLS:
             data = {}
@@ -254,9 +258,14 @@ async def main():
                 except Exception:
                     log.exception("BACKTEST DATA FAILED | %s %s", symbol, interval)
                     data[interval] = []
-            all_results[symbol] = backtest_symbol(symbol, data)
+            datasets[symbol] = data
 
-    report(all_results)
+    baseline = {symbol: backtest_symbol(symbol, data, apply_reversal_filter=False)
+                for symbol, data in datasets.items()}
+    filtered = {symbol: backtest_symbol(symbol, data, apply_reversal_filter=True)
+                for symbol, data in datasets.items()}
+    report(baseline, label="BASELINE WITHOUT 1m FILTER")
+    report(filtered, label="WITH 1m REVERSAL FILTER")
 
 
 if __name__ == "__main__":
