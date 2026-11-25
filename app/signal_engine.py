@@ -94,14 +94,15 @@ def _trend(candles):
 
 
 def _reversal_conflict(candles, side):
-    """Detect a counter-trend 1m turn using fast EMA, momentum, structure and volume."""
+    """Detect sustained counter-trend 1m pressure without reacting to one weak candle."""
     if len(candles) < 30:
         return True, "недостаточно 1m истории"
 
     closes = [c["close"] for c in candles]
     last = candles[-1]
     e5, e13 = ema(closes, 5), ema(closes, 13)
-    if e5 is None or e13 is None:
+    prev_e5, prev_e13 = ema(closes[:-1], 5), ema(closes[:-1], 13)
+    if None in (e5, e13, prev_e5, prev_e13):
         return True, "недостаточно 1m индикаторов"
 
     recent_closes = closes[-5:]
@@ -113,27 +114,36 @@ def _reversal_conflict(candles, side):
     candle_range = max(last["high"] - last["low"], last["close"] * 1e-9)
     body_ratio = abs(last["close"] - last["open"]) / candle_range
     volume_impulse = avg_volume > 0 and last["volume"] >= 1.15 * avg_volume and body_ratio >= 0.55
-
     prior = candles[-4:-1]
-    if side == "SHORT":
-        confirmations = {
-            "быстрые EMA 1m направлены вверх": last["close"] > e5 and e5 > e13,
-            "последние 1m свечи показывают рост": rising_steps >= 3 and current_rsi is not None and current_rsi > 50,
-            "цена пробила максимум последних 3 минут": last["close"] > max(c["high"] for c in prior),
-            "бычий импульс подтверждён объёмом": last["close"] > last["open"] and volume_impulse,
-        }
-        reason = "восходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
-    else:
-        confirmations = {
-            "быстрые EMA 1m направлены вниз": last["close"] < e5 and e5 < e13,
-            "последние 1m свечи показывают снижение": falling_steps >= 3 and current_rsi is not None and current_rsi < 50,
-            "цена пробила минимум последних 3 минут": last["close"] < min(c["low"] for c in prior),
-            "медвежий импульс подтверждён объёмом": last["close"] < last["open"] and volume_impulse,
-        }
-        reason = "нисходящий разворот 1m: " + ", ".join(k for k, v in confirmations.items() if v)
 
-    confirmed = sum(bool(value) for value in confirmations.values()) >= 2
-    return confirmed, reason if confirmed else "нет двух подтверждений разворота 1m"
+    if side == "SHORT":
+        ema_pressure = last["close"] > e5 and e5 > e13 and prev_e5 > prev_e13
+        momentum = rising_steps >= 3 and current_rsi is not None and current_rsi > 50
+        structure_break = last["close"] > max(c["high"] for c in prior)
+        impulse = last["close"] > last["open"] and volume_impulse
+        confirmed = ema_pressure or (momentum and (structure_break or impulse)) or (structure_break and impulse)
+        active = [name for name, flag in (
+            ("fast EMA 1m вверх", ema_pressure),
+            ("восходящий импульс 1m", momentum),
+            ("пробит локальный максимум", structure_break),
+            ("бычья свеча с объёмом", impulse),
+        ) if flag]
+        reason = "восходящий разворот 1m: " + ", ".join(active)
+    else:
+        ema_pressure = last["close"] < e5 and e5 < e13 and prev_e5 < prev_e13
+        momentum = falling_steps >= 3 and current_rsi is not None and current_rsi < 50
+        structure_break = last["close"] < min(c["low"] for c in prior)
+        impulse = last["close"] < last["open"] and volume_impulse
+        confirmed = ema_pressure or (momentum and (structure_break or impulse)) or (structure_break and impulse)
+        active = [name for name, flag in (
+            ("fast EMA 1m вниз", ema_pressure),
+            ("нисходящий импульс 1m", momentum),
+            ("пробит локальный минимум", structure_break),
+            ("медвежья свеча с объёмом", impulse),
+        ) if flag]
+        reason = "нисходящий разворот 1m: " + ", ".join(active)
+
+    return confirmed, reason if confirmed else "нет подтверждённого встречного движения 1m"
 
 
 
