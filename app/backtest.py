@@ -72,7 +72,7 @@ async def fetch_candles(session, symbol, interval):
     return [unique[key] for key in sorted(unique)]
 
 
-def simulate_trade(signal, future_candles, horizon_bars=HORIZON_BARS):
+def simulate_trade(signal, future_candles):
     """Mirror the live paper exit plan: 70% at 0.8R, 20% at 1.5R,
     then trail the final 10%; 2.2R is an optional full runner exit.
     Conservative same-candle ordering assumes the active stop fills first.
@@ -95,7 +95,7 @@ def simulate_trade(signal, future_candles, horizon_bars=HORIZON_BARS):
     trail_buffer = 0.15 * risk
     lock_profit = 0.10 * risk
 
-    for index, candle in enumerate(future_candles[:horizon_bars]):
+    for index, candle in enumerate(future_candles[:HORIZON_BARS]):
         stop_hit = (candle["low"] <= active_stop if side == "LONG"
                     else candle["high"] >= active_stop)
         if stop_hit:
@@ -131,10 +131,10 @@ def simulate_trade(signal, future_candles, horizon_bars=HORIZON_BARS):
             else:
                 active_stop = min(active_stop, candle["high"] + trail_buffer)
 
-    last_price = future_candles[min(len(future_candles), horizon_bars) - 1]["close"]
+    last_price = future_candles[min(len(future_candles), HORIZON_BARS) - 1]["close"]
     direction = 1.0 if side == "LONG" else -1.0
     realized_r += remaining * direction * (last_price - entry) / risk
-    return realized_r, min(len(future_candles), horizon_bars) - 1
+    return realized_r, min(len(future_candles), HORIZON_BARS) - 1
 
 
 def backtest_symbol(symbol, data, apply_reversal_filter=True):
@@ -181,14 +181,19 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         signal_time = as_of
         if apply_reversal_filter:
             # Wait for the first fully closed 1m candle after the 5m setup.
-            if j1 >= len(one) or j1 + 5 > len(one):
+            if j1 >= len(one):
                 blocked_signals += 1
-                filter_reasons["no complete post-signal 1m window"] += 1
+                filter_reasons["no post-signal 1m candle"] += 1
                 index += 1
                 continue
             confirmation_candle = one[j1]
-            confirmed_signal = confirm_signal_with_1m(signal, confirmation_candle)
             confirm_time = confirmation_candle["close_time"]
+            if confirm_time <= as_of or confirm_time - as_of > 120_000:
+                blocked_signals += 1
+                filter_reasons["post-signal 1m candle arrived too late"] += 1
+                index += 1
+                continue
+            confirmed_signal = confirm_signal_with_1m(signal, confirmation_candle)
             confirm_label = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(confirm_time / 1000))
             if not confirmed_signal:
                 blocked_signals += 1
@@ -213,12 +218,10 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
                 continue
 
         if apply_reversal_filter:
-            # The first 1m candle confirmed the entry. Simulate the remaining
-            # four minutes of that 5m bar at 1m resolution, then resume 5m bars.
-            future_1m = one[j1 + 1:j1 + 5]
-            future_5m = five[index + 2:index + 2 + (HORIZON_BARS - 1)]
-            future = future_1m + future_5m
-            gross_r, exit_offset = simulate_trade(signal, future, horizon_bars=len(future))
+            # The paper book already processed the 5m candle containing the
+            # 1m confirmation. Management starts on the next completed 5m bar.
+            future = five[index + 2:index + 2 + HORIZON_BARS]
+            gross_r, exit_offset = simulate_trade(signal, future)
         else:
             future = five[index + 1:index + 1 + HORIZON_BARS]
             gross_r, exit_offset = simulate_trade(signal, future)
@@ -237,7 +240,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         })
         last_signal = {"side": signal["side"], "time": signal_time}
         if apply_reversal_filter:
-            index += 2 if exit_offset < 4 else exit_offset - 1
+            index += exit_offset + 3
         else:
             index += exit_offset + 2
 
