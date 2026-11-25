@@ -291,15 +291,10 @@ def confirm_signal_with_1m(signal, candle):
     delta = close_price - entry
 
     if signal["side"] == "SHORT":
-        # Reject adverse movement beyond 0.25R; avoid chasing a favorable move beyond 0.5R.
-        if delta > 0.25 * risk or delta < -0.50 * risk:
-            return None
         if close_price > open_price and close_price > entry:
             return None
         direction_text = "1m close did not break upward through the SHORT entry"
     else:
-        if delta < -0.25 * risk or delta > 0.50 * risk:
-            return None
         if close_price < open_price and close_price < entry:
             return None
         direction_text = "1m close did not break downward through the LONG entry"
