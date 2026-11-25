@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from statistics import mean
 
 
-INTERVALS = ("5m", "15m", "1h")
+INTERVALS = ("1m", "5m", "15m", "1h")
 MAX_CANDLES = 240
 
 
@@ -92,6 +92,34 @@ def _trend(candles):
     return "NEUTRAL"
 
 
+
+def _reversal_conflict(candles, side):
+    """Detect a confirmed 1m counter-trend reversal, not a lone opposite candle."""
+    if len(candles) < 24:
+        return True, "недостаточно 1m истории"
+    recent = candles[-8:]
+    prior = candles[-14:-2]
+    if len(prior) < 8:
+        return True, "недостаточно 1m структуры"
+    avg_volume = mean(c["volume"] for c in candles[-21:-1])
+    last = recent[-1]
+    candle_range = max(last["high"] - last["low"], last["close"] * 1e-9)
+    body_ratio = abs(last["close"] - last["open"]) / candle_range
+    volume_ok = avg_volume > 0 and last["volume"] >= 1.20 * avg_volume
+    higher_lows = all(recent[i]["low"] >= recent[i - 1]["low"] for i in range(len(recent) - 3, len(recent)))
+    lower_highs = all(recent[i]["high"] <= recent[i - 1]["high"] for i in range(len(recent) - 3, len(recent)))
+    if side == "SHORT":
+        structure_break = last["close"] > max(c["high"] for c in prior)
+        impulse = last["close"] > last["open"] and body_ratio >= 0.60 and volume_ok
+        conflict = structure_break and (higher_lows or impulse)
+        reason = "1m пробил локальный максимум и подтвердил восходящий импульс"
+    else:
+        structure_break = last["close"] < min(c["low"] for c in prior)
+        impulse = last["close"] < last["open"] and body_ratio >= 0.60 and volume_ok
+        conflict = structure_break and (lower_highs or impulse)
+        reason = "1m пробил локальный минимум и подтвердил нисходящий импульс"
+    return conflict, reason if conflict else "1m разворот против сигнала не подтверждён"
+
 def _fmt_price(value):
     if value >= 1000:
         return f"{value:,.2f}"
@@ -100,15 +128,20 @@ def _fmt_price(value):
     return f"{value:.6f}"
 
 
-def evaluate(symbol, candles_by_interval, as_of_ms=None):
+def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=True):
     """Return a signal dict only when strict conditions align."""
     candles = {tf: list(candles_by_interval.get(tf, ())) for tf in INTERVALS}
-    if any(len(candles[tf]) < 60 for tf in INTERVALS):
+    required = ("5m", "15m", "1h")
+    if any(len(candles[tf]) < 60 for tf in required):
+        return None
+    if apply_reversal_filter and len(candles["1m"]) < 24:
         return None
 
-    c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
+    c1, c5, c15, c1h = candles["1m"], candles["5m"], candles["15m"], candles["1h"]
     now_ms = as_of_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     freshness_limits = {"5m": 12 * 60 * 1000, "15m": 35 * 60 * 1000, "1h": 2 * 60 * 60 * 1000}
+    if apply_reversal_filter:
+        freshness_limits["1m"] = 3 * 60 * 1000
     for timeframe, limit_ms in freshness_limits.items():
         latest = candles[timeframe][-1].get("close_time", 0)
         if not latest or now_ms - latest > limit_ms:
@@ -155,6 +188,11 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
             return None
         side = "SHORT"
 
+    if apply_reversal_filter:
+        reversal, reversal_reason = _reversal_conflict(c1, side)
+        if reversal:
+            return None
+
     recent = c5[-12:-1]
     if side == "LONG":
         structural = min(c["low"] for c in recent) - 0.10 * atr5
@@ -195,6 +233,8 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
         f"MACD histogram: {'+' if hist > 0 else '-'}",
         "Закрытая 5m свеча подтвердила направление",
     ]
+    if apply_reversal_filter:
+        reasons.append("1m фильтр: встречный разворот не подтверждён")
     return {
         "symbol": symbol,
         "side": side,
