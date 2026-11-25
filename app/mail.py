@@ -10,7 +10,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from collections import deque
+from collections import Counter, deque
 
 import aiohttp
 import websockets
@@ -400,6 +400,10 @@ async def binance_signal_monitor(session, symbols):
         symbol: {timeframe: deque(maxlen=MAX_CANDLES) for timeframe in INTERVALS}
         for symbol in symbols
     }
+    scan_rejections = Counter()
+    scan_evaluations = 0
+    scan_signals = 0
+    last_scan_report = time.monotonic()
 
     async def dispatch_signal(signal):
         symbol = signal["symbol"]
@@ -612,9 +616,24 @@ async def binance_signal_monitor(session, symbols):
                                     sprint_signal["side"], symbol, paper_sprint_book.status()
                                 )
 
-                    signal = evaluate(symbol, histories[symbol])
+                    scan_evaluations += 1
+                    signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
                     if signal:
+                        scan_signals += 1
                         await dispatch_signal(signal)
+
+                    now_mono = time.monotonic()
+                    if now_mono - last_scan_report >= 300:
+                        top_rejections = scan_rejections.most_common(6)
+                        log.info(
+                            "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
+                            len(symbols), scan_evaluations, scan_signals,
+                            top_rejections, ",".join(INTERVALS)
+                        )
+                        scan_rejections.clear()
+                        scan_evaluations = 0
+                        scan_signals = 0
+                        last_scan_report = now_mono
 
         except asyncio.CancelledError:
             raise

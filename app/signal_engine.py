@@ -11,6 +11,13 @@ INTERVALS = ("5m", "15m", "1h")
 MAX_CANDLES = 240
 
 
+def _reject(diagnostics, reason):
+    """Record why a closed-candle evaluation did not qualify, when requested."""
+    if diagnostics is not None:
+        diagnostics[reason] = diagnostics.get(reason, 0) + 1
+    return None
+
+
 def ema(values, period):
     if len(values) < period:
         return None
@@ -101,59 +108,59 @@ def _fmt_price(value):
     return f"{value:.6f}"
 
 
-def evaluate(symbol, candles_by_interval, as_of_ms=None):
+def evaluate(symbol, candles_by_interval, as_of_ms=None, diagnostics=None):
     """Return a signal dict only when strict conditions align."""
     candles = {tf: list(candles_by_interval.get(tf, ())) for tf in INTERVALS}
     required = ("5m", "15m", "1h")
     if any(len(candles[tf]) < 60 for tf in required):
-        return None
+        return _reject(diagnostics, "history_short")
     c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
     now_ms = as_of_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     freshness_limits = {"5m": 12 * 60 * 1000, "15m": 35 * 60 * 1000, "1h": 2 * 60 * 60 * 1000}
     for timeframe, limit_ms in freshness_limits.items():
         latest = candles[timeframe][-1].get("close_time", 0)
         if not latest or now_ms - latest > limit_ms:
-            return None
+            return _reject(diagnostics, "stale_candles")
     closes5 = [c["close"] for c in c5]
     last = c5[-1]
     price = last["close"]
     atr5 = atr(c5)
     atr15 = atr(c15)
     if not atr5 or not atr15 or price <= 0:
-        return None
+        return _reject(diagnostics, "invalid_atr_or_price")
 
     trend15, trend1h = _trend(c15), _trend(c1h)
     if trend15 not in ("LONG", "SHORT") or trend15 != trend1h:
-        return None
+        return _reject(diagnostics, "trend_misaligned")
 
     rsi5, rsi15 = rsi(closes5), rsi([c["close"] for c in c15])
     hist = macd_histogram(closes5)
     if rsi5 is None or rsi15 is None or hist is None:
-        return None
+        return _reject(diagnostics, "indicator_unavailable")
 
     ema20_5 = ema(closes5, 20)
     if ema20_5 is None or abs(price - ema20_5) > 1.25 * atr5:
-        return None
+        return _reject(diagnostics, "price_too_far_from_ema")
 
     body = last["close"] - last["open"]
     candle_range = max(last["high"] - last["low"], price * 1e-9)
     body_ratio = abs(body) / candle_range
     if body_ratio < 0.45:
-        return None
+        return _reject(diagnostics, "weak_candle_body")
 
     volumes = [c["volume"] for c in c5[-21:-1]]
     avg_volume = mean(volumes) if volumes else 0
     volume_ratio = last["volume"] / avg_volume if avg_volume > 0 else 0
     if volume_ratio < 1.15:
-        return None
+        return _reject(diagnostics, "low_volume")
 
     if trend15 == "LONG":
         if not (body > 0 and 48 <= rsi5 <= 68 and 50 <= rsi15 <= 70 and hist > 0):
-            return None
+            return _reject(diagnostics, "momentum_not_confirmed")
         side = "LONG"
     else:
         if not (body < 0 and 32 <= rsi5 <= 52 and 30 <= rsi15 <= 50 and hist < 0):
-            return None
+            return _reject(diagnostics, "momentum_not_confirmed")
         side = "SHORT"
 
     recent = c5[-12:-1]
@@ -167,7 +174,7 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
         risk = stop - price
 
     if risk <= 0 or risk > 2.5 * atr5:
-        return None
+        return _reject(diagnostics, "risk_out_of_range")
 
     # Bring the first cash-out closer and avoid relying on a distant 3R target.
     target_r = (0.80, 1.50, 2.20)
@@ -180,7 +187,7 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
     confidence += 5 if 37 <= rsi5 <= 48 and side == "SHORT" else 0
     confidence = min(confidence, 90)
     if confidence < 75:
-        return None
+        return _reject(diagnostics, "confidence_below_75")
 
     close_time = last.get("close_time")
     if close_time:
