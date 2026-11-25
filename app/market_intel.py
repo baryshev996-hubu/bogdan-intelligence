@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import defaultdict, deque
+from html import escape
 import websockets
 
 log = logging.getLogger("bogdan-intel.market")
@@ -154,6 +155,62 @@ def format_flow_context(context):
     return "\n".join(lines)
 
 
+def format_whale_alert(coin, side, total, largest, avg_price, count, context, alert_tier):
+    """Telegram HTML card for public taker-flow observations, not trade advice."""
+    separator = "━━━━━━━━━━━━━━━━━━"
+    reaction = context.get("reaction", "НЕТ ПОДТВЕРЖДЕНИЯ")
+    status_icon = alert_tier.split(" ", 1)[0]
+    buying = side == "BUY"
+    side_icon = "🟢" if buying else "🔴"
+    flow_text = "агрессивные покупки" if buying else "агрессивные продажи"
+
+    def pct(value, decimals=3, arrow=False):
+        if value is None:
+            return "н/д"
+        suffix = (" ↗" if value > 0 else " ↘" if value < 0 else " →") if arrow else ""
+        return f"<code>{value:+.{decimals}f}%</code>{suffix}"
+
+    p1 = context.get("price_change_1m")
+    price_text = ("растёт" if p1 > 0 else "снижается" if p1 < 0 else "без изменений") if p1 is not None else "н/д"
+    funding = context.get("funding")
+    interpretation = (
+        "Цена подтверждает направление потока." if status_icon == "🟢"
+        else "Цена идёт против потока. Возможно поглощение встречными заявками." if status_icon == "🟡"
+        else "Подтверждения направления пока нет."
+    )
+    return "\n".join([
+        f"🐳 BOGDAN INTELLIGENCE | {escape(alert_tier)} | {escape(str(coin))}",
+        "",
+        f"<b>{escape(str(coin))} | WHALE ACTIVITY</b>",
+        f"{status_icon} <b>{escape(reaction.capitalize())}</b>",
+        separator,
+        f"<i>ОБЪЁМ ПОТОКА ЗА {WHALE_WINDOW_SECONDS} СЕКУНД</i>",
+        f"<b>${total:,.0f}</b>",
+        f"{side_icon} <b>{escape(side)} FLOW</b> · {count} исполнений",
+        separator,
+        "💰 <b>Активность крупных игроков</b>",
+        f"Крупнейшее исполнение: <b>${largest:,.0f}</b>",
+        f"VWAP: <code>${format(avg_price, ',.6f').rstrip('0').rstrip('.')}</code>",
+        separator,
+        "📊 <b>Реакция Binance Futures</b>",
+        f"Изменение 1m: {pct(p1, arrow=True)}",
+        f"Изменение 5m: {pct(context.get('price_change_5m'), arrow=True)}",
+        f"Open Interest 5m: {pct(context.get('oi_change_5m'))}",
+        f"Funding: {pct(funding * 100 if funding is not None else None, 4)}",
+        separator,
+        "🧠 <b>Интерпретация рынка</b>",
+        f"{side_icon} Поток: {flow_text}.",
+        f"Цена 1m: {price_text}.",
+        f"{status_icon} {interpretation}",
+        "",
+        "<b>Статус: наблюдение за рынком.</b>",
+        separator,
+        "<i>Источник потока: Hyperliquid</i>",
+        "<i>Проверка реакции: Binance Futures</i>",
+        "Аналитическое уведомление, не торговый сигнал. Данные потока с одной площадки.",
+    ])
+
+
 async def hyperliquid_whale_monitor(session, coins=None):
     """Aggregate large public taker flow to avoid one Telegram alert per print."""
     watch_coins = [s.upper() for s in (coins if coins is not None else COINS)]
@@ -211,18 +268,9 @@ async def hyperliquid_whale_monitor(session, coins=None):
                             )
                             if alert_tier.startswith("⚪"):
                                 continue
-                            await send(session,
-                                "🐳 BOGDAN INTELLIGENCE | " + alert_tier + " | " + coin + "\n"
-                                + "Направление потока: " + side + (" 🟢" if side == "BUY" else " 🔴") + "\n"
-                                + "Объём за " + str(WHALE_WINDOW_SECONDS) + " сек.: $" + format(total, ",.0f") + "\n"
-                                + "Крупнейшее исполнение: $" + format(largest, ",.0f") + "\n"
-                                + "VWAP потока: $" + format(avg_price, ",.6f").rstrip("0").rstrip(".") + "\n"
-                                + "Количество исполнений: " + str(len(bucket)) + "\n\n"
-                                + "ПОДТВЕРЖДЕНИЕ BINANCE FUTURES\n"
-                                + format_flow_context(context) + "\n\n"
-                                + "Как читать: подтверждение = цена движется в сторону taker-потока; поглощение = цена идёт против потока; без подтверждения = наблюдать, не входить.\n"
-                                + "Это аналитическое уведомление, не торговый сигнал. Hyperliquid показывает только одну площадку."
-                            )
+                            await send(session, format_whale_alert(
+                                coin, side, total, largest, avg_price, len(bucket), context, alert_tier
+                            ))
                             log.info("HYPERLIQUID FLOW ALERT | %s %s | usd=%.0f | prints=%d",
                                      coin, side, total, len(bucket))
                         except (TypeError, ValueError):

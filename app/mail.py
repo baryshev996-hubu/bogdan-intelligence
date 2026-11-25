@@ -302,9 +302,14 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
                 "text": message,
                 "disable_web_page_preview": True,
             }
-            # New signal cards only: old queued plaintext and other alerts stay unchanged.
+            # New signal and whale cards only; other alerts remain plaintext.
             header = message.splitlines()[0] if message else ""
-            if header in {"🟢 BOGDAN INTELLIGENCE | LONG", "🔴 BOGDAN INTELLIGENCE | SHORT"} and "\n\n<b>" in message:
+            is_signal_card = header in {"🟢 BOGDAN INTELLIGENCE | LONG", "🔴 BOGDAN INTELLIGENCE | SHORT"}
+            is_whale_card = header.startswith((
+                "🐳 BOGDAN INTELLIGENCE | 🟢 FLOW CONFIRMED | ",
+                "🐳 BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION | ",
+            ))
+            if (is_signal_card or is_whale_card) and "\n\n<b>" in message:
                 payload["parse_mode"] = "HTML"
             recipient_delivered = False
             for attempt in range(4):
