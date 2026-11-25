@@ -311,10 +311,10 @@ def evaluate_symbol(symbol, candles):
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days", type=int, default=60)
-    parser.add_argument("--symbols", type=int, default=30, choices=(30, 100))
+    parser.add_argument("--symbols", type=int, default=30, choices=(30,))
     parser.add_argument("--output", default="reversal_backtest.json")
     args = parser.parse_args()
-    symbols = DEFAULT_SYMBOLS if args.symbols == 30 else DEFAULT_SYMBOLS
+    symbols = DEFAULT_SYMBOLS
     # Use only complete UTC days so the requested history is fully available
     # from Binance public daily/monthly archives.
     now = datetime.now(timezone.utc)
