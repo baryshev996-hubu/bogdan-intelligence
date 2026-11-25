@@ -280,28 +280,29 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=T
 
 
 def confirm_signal_with_1m(signal, candle):
-    """Confirm a 5m setup with the first fully closed 1m candle after the signal."""
+    """Veto a strong 1m reversal, otherwise reprice the pending entry at the 1m close."""
     entry = float(signal["entry"])
     open_price = float(candle["open"])
     close_price = float(candle["close"])
     candle_range = max(float(candle["high"]) - float(candle["low"]), close_price * 1e-9)
     body_ratio = abs(close_price - open_price) / candle_range
     risk = abs(entry - float(signal["stop"]))
-    if risk <= 0 or body_ratio < 0.25:
+    if risk <= 0:
         return None
 
     delta = close_price - entry
     if abs(delta) > 0.25 * risk:
         return None
 
+    strong_countertrend = body_ratio >= 0.40
     if signal["side"] == "SHORT":
-        confirmed = close_price < open_price and close_price <= entry
-        direction_text = "медвежья 1m свеча подтвердила SHORT"
+        if strong_countertrend and close_price > open_price and close_price > entry:
+            return None
+        direction_text = "1m не подтвердил сильный разворот вверх, вход переоценён по закрытию"
     else:
-        confirmed = close_price > open_price and close_price >= entry
-        direction_text = "бычья 1m свеча подтвердила LONG"
-    if not confirmed:
-        return None
+        if strong_countertrend and close_price < open_price and close_price < entry:
+            return None
+        direction_text = "1m не подтвердил сильный разворот вниз, вход переоценён по закрытию"
 
     adjusted = dict(signal)
     adjusted["entry"] = close_price
@@ -314,6 +315,7 @@ def confirm_signal_with_1m(signal, candle):
     ).strftime("%Y-%m-%d %H:%M:%S UTC")
     adjusted["reasons"] = list(signal.get("reasons", [])) + [direction_text]
     return adjusted
+
 
 
 def format_signal(signal):
