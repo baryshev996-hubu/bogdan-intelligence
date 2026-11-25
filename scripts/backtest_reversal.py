@@ -36,6 +36,7 @@ INTERVAL_MS = 300_000
 FEE_RATE = 0.0005
 SLIPPAGE = 0.0001
 MAX_HOLD_BARS = 144
+ARCHIVE_SEMAPHORE = asyncio.Semaphore(10)
 
 
 async def fetch_top_symbols(session, count):
@@ -126,7 +127,7 @@ async def fetch_klines(session, symbol, start_ms, end_ms, semaphore):
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                         if response.status == 451:
-                            return await fetch_archive_klines(session, symbol, start_ms, end_ms, semaphore)
+                            return await fetch_archive_klines(session, symbol, start_ms, end_ms, ARCHIVE_SEMAPHORE)
                         response.raise_for_status()
                         batch = await response.json()
                         break
