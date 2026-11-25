@@ -277,7 +277,7 @@ class PaperBook:
                 self._close_trade(symbol, reason)
                 return
 
-            favorable_excursion = direction * (
+            favorable_excursion = (
                 (high - entry) if side == "LONG" else (entry - low)
             )
             if (not trade.get("breakeven_moved")
