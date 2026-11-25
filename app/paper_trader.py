@@ -177,7 +177,7 @@ class PaperBook:
             self._exit(trade, close, 1.0, "CHALLENGE_END")
             self._close_trade(symbol, "CHALLENGE_END")
             return
-        # A 5m candle that began before a delayed 1m-confirmed entry must not
+        # A 5m candle that began before a delayed entry must not
         # manage the new position using price action from before the entry.
         if int(candle.get("open_time", 0)) < int(trade.get("entry_time", 0)):
             return
