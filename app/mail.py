@@ -16,7 +16,7 @@ import aiohttp
 import websockets
 from dotenv import load_dotenv
 
-from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
+from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal, confirm_signal_with_1m
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
@@ -294,6 +294,71 @@ async def binance_signal_monitor(session, symbols):
         symbol: {timeframe: deque(maxlen=MAX_CANDLES) for timeframe in INTERVALS}
         for symbol in symbols
     }
+    pending_signals = {}
+
+    async def dispatch_confirmed_signal(signal):
+        symbol = signal["symbol"]
+        now = time.time()
+        previous = last_signal_sent.get(symbol)
+        if previous:
+            cooldown = (
+                SIGNAL_SAME_SIDE_COOLDOWN
+                if previous["side"] == signal["side"]
+                else SIGNAL_FLIP_COOLDOWN
+            )
+            if now - previous["sent_at"] < cooldown:
+                log.info("SIGNAL COOLDOWN | %s %s", signal["side"], symbol)
+                return
+
+        if paper_book.active():
+            opened = paper_book.open_trade(signal)
+            if opened:
+                log.info("PAPER STATUS | %s", paper_book.status())
+        if paper_sprint_book.active():
+            sprint_opened = paper_sprint_book.open_trade(signal)
+            if sprint_opened:
+                log.info("PAPER SPRINT STATUS | %s", paper_sprint_book.status())
+
+        if not ENABLE_SIGNAL_DELIVERY:
+            log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s", signal["side"], symbol)
+            return
+
+        delivered = await telegram_send(session, format_signal(signal))
+        if delivered:
+            last_signal_sent[symbol] = {
+                "side": signal["side"],
+                "sent_at": now,
+                "candle_id": signal["candle_id"],
+            }
+            log.info("SIGNAL DELIVERED | %s %s | confidence=%s",
+                     signal["side"], symbol, signal["confidence"])
+        else:
+            log.warning("SIGNAL NOT DELIVERED | %s %s", signal["side"], symbol)
+
+    async def confirm_pending_signal(symbol, confirmation_candle):
+        pending = pending_signals.get(symbol)
+        if not pending:
+            return
+        age_ms = confirmation_candle["close_time"] - pending["signal_close_time"]
+        if age_ms <= 0:
+            return
+        if age_ms > 120_000:
+            pending_signals.pop(symbol, None)
+            log.info("SIGNAL EXPIRED | %s %s | no 1m confirmation within 2 minutes",
+                     pending["signal"]["side"], symbol)
+            return
+
+        pending_signals.pop(symbol, None)
+        confirmed = confirm_signal_with_1m(pending["signal"], confirmation_candle)
+        if not confirmed:
+            log.info("SIGNAL SKIPPED | %s %s | next 1m candle did not confirm entry",
+                     pending["signal"]["side"], symbol)
+            return
+
+        log.info("SIGNAL 1m CONFIRMED | %s %s | entry=%.6f | 1m close=%s",
+                 confirmed["side"], symbol, confirmed["entry"],
+                 confirmation_candle["close_time"])
+        await dispatch_confirmed_signal(confirmed)
 
     # Load only completed candles. Never evaluate an unfinished candle.
     for symbol in symbols:
@@ -351,6 +416,9 @@ async def binance_signal_monitor(session, symbols):
                     }
                     store_closed_candle(histories[symbol][timeframe], candle)
 
+                    if timeframe == "1m":
+                        await confirm_pending_signal(symbol, candle)
+                        continue
                     if timeframe != "5m":
                         continue
 
@@ -358,7 +426,7 @@ async def binance_signal_monitor(session, symbols):
                     paper_book.on_candle(symbol, candle)
                     paper_sprint_book.on_candle(symbol, candle)
 
-                    signal = evaluate(symbol, histories[symbol])
+                    signal = evaluate(symbol, histories[symbol], apply_reversal_filter=False)
                     if not signal:
                         continue
 
@@ -383,33 +451,28 @@ async def binance_signal_monitor(session, symbols):
                         }
                         continue
 
-                    # The virtual portfolio is independent of Telegram delivery.
-                    if paper_book.active():
-                        opened = paper_book.open_trade(signal)
-                        if opened:
-                            log.info("PAPER STATUS | %s", paper_book.status())
-                    if paper_sprint_book.active():
-                        sprint_opened = paper_sprint_book.open_trade(signal)
-                        if sprint_opened:
-                            log.info("PAPER SPRINT STATUS | %s", paper_sprint_book.status())
+                    existing = pending_signals.get(symbol)
+                    if existing:
+                        age_ms = candle["close_time"] - existing["signal_close_time"]
+                        if age_ms > 120_000:
+                            pending_signals.pop(symbol, None)
+                            log.info("SIGNAL EXPIRED | %s %s | replacing stale pending signal",
+                                     existing["signal"]["side"], symbol)
+                        else:
+                            continue
 
-                    if not ENABLE_SIGNAL_DELIVERY:
-                        log.info("SIGNAL SUPPRESSED BY CONFIG | %s %s",
-                                 signal["side"], symbol)
-                        continue
+                    pending_signals[symbol] = {
+                        "signal": signal,
+                        "signal_close_time": candle["close_time"],
+                    }
+                    log.info("SIGNAL PENDING 1m CONFIRM | %s %s | reference_entry=%.6f",
+                             signal["side"], symbol, signal["entry"])
 
-                    delivered = await telegram_send(session, format_signal(signal))
-                    if delivered:
-                        last_signal_sent[symbol] = {
-                            "side": signal["side"],
-                            "sent_at": now,
-                            "candle_id": signal["candle_id"],
-                        }
-                        log.info("SIGNAL DELIVERED | %s %s | confidence=%s",
-                                 signal["side"], symbol, signal["confidence"])
-                    else:
-                        log.warning("SIGNAL NOT DELIVERED | %s %s",
-                                    signal["side"], symbol)
+                    # Handle websocket ordering where the next 1m close arrived
+                    # before the corresponding 5m close event.
+                    latest_1m = histories[symbol]["1m"][-1] if histories[symbol]["1m"] else None
+                    if latest_1m and latest_1m["close_time"] > candle["close_time"]:
+                        await confirm_pending_signal(symbol, latest_1m)
 
         except asyncio.CancelledError:
             raise
