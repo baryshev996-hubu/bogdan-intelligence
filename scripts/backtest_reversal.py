@@ -10,9 +10,13 @@ import asyncio
 import json
 import statistics
 import time
+import sys
+from pathlib import Path
 from collections import defaultdict
 
 import aiohttp
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.reversal_filter import reversal_warning
 from app.signal_engine import evaluate
