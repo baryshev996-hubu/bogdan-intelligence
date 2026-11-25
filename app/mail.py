@@ -548,15 +548,45 @@ async def binance_signal_monitor(session, symbols):
                     subscription_batch_size, ",".join(INTERVALS)
                 )
 
-                async for raw in websocket:
+                ws_messages = 0
+                closed_candles = 0
+                subscription_acks = 0
+                subscription_rejections = 0
+                last_ws_health = time.monotonic()
+                last_ws_packet_at = last_ws_health
+
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(websocket.recv(), timeout=45)
+                    except asyncio.TimeoutError:
+                        now_mono = time.monotonic()
+                        idle_seconds = now_mono - last_ws_packet_at
+                        if now_mono - last_ws_health >= 60:
+                            log.warning(
+                                "BINANCE WS HEALTH | messages=%d | closed_candles=%d | subscription_acks=%d | rejected=%d | idle_seconds=%.0f",
+                                ws_messages, closed_candles, subscription_acks,
+                                subscription_rejections, idle_seconds
+                            )
+                            last_ws_health = now_mono
+                        if idle_seconds >= 120:
+                            raise TimeoutError(
+                                f"Binance WebSocket received no data for {idle_seconds:.0f}s"
+                            )
+                        continue
+
+                    last_ws_packet_at = time.monotonic()
+                    ws_messages += 1
                     packet = json.loads(raw)
                     # Raw /ws subscriptions return the event directly.
-                    # Ignore the subscription acknowledgement.
+                    # Count acknowledgements so a connected socket is not mistaken
+                    # for a successfully subscribed market-data stream.
                     if "id" in packet and "result" in packet:
                         if packet.get("result") is None:
+                            subscription_acks += 1
                             log.debug("BINANCE SUBSCRIPTION ACK | id=%s", packet.get("id"))
                         continue
                     if "id" in packet and ("code" in packet or "msg" in packet):
+                        subscription_rejections += 1
                         log.error("BINANCE SUBSCRIPTION REJECTED | id=%s | code=%s | message=%s",
                                   packet.get("id"), packet.get("code"), packet.get("msg"))
                         continue
@@ -580,6 +610,16 @@ async def binance_signal_monitor(session, symbols):
                         "close_time": int(kline["T"]),
                     }
                     store_closed_candle(histories[symbol][timeframe], candle)
+                    closed_candles += 1
+
+                    now_mono = time.monotonic()
+                    if now_mono - last_ws_health >= 60:
+                        log.info(
+                            "BINANCE WS HEALTH | messages=%d | closed_candles=%d | subscription_acks=%d | rejected=%d | idle_seconds=0",
+                            ws_messages, closed_candles, subscription_acks,
+                            subscription_rejections
+                        )
+                        last_ws_health = now_mono
 
                     if timeframe != "5m":
                         continue
@@ -628,7 +668,6 @@ async def binance_signal_monitor(session, symbols):
                         scan_signals += 1
                         await dispatch_signal(signal)
 
-                    now_mono = time.monotonic()
                     if now_mono - last_scan_report >= 300:
                         top_rejections = scan_rejections.most_common(6)
                         log.info(
