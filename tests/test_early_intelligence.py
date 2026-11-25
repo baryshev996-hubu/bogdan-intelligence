@@ -9,7 +9,9 @@ class EarlyIntelligenceTests(unittest.TestCase):
         events = binance_events({"symbols": [row, dict(row, status="TRADING"),
                                               dict(row, underlyingType="STOCK"), dict(row, baseAsset="JD")]})
         self.assertEqual(len(events), 1)
-        self.assertIn("не подтверждение обычного листинга", format_prelaunch(events[0]))
+        message = format_prelaunch(events[0])
+        self.assertIn("не подтверждение обычного листинга", message)
+        self.assertIn("пока без позиции", message)
 
     def test_bybit_premarket(self):
         row = dict(symbol="EXMUSDT", baseCoin="EXM", quoteCoin="USDT", status="PreLaunch",
@@ -30,7 +32,18 @@ class EarlyIntelligenceTests(unittest.TestCase):
         btc = [dict(open=100, close=100.1, close_time=20)]
         result = anomaly("EXMUSDT", history + [final], btc)
         self.assertIsNotNone(result)
-        self.assertIn("не LONG/SHORT сигнал", format_anomaly(result))
+        message = format_anomaly(result)
+        self.assertIn("не LONG/SHORT сигнал", message)
+        self.assertIn("Я бы рассматривал LONG", message)
+        self.assertIn("агрессивные покупки 80.0%", message)
+        self.assertIn("Подтверждение:", message)
+        self.assertIn("Отмена:", message)
+        short = anomaly("EXMUSDT", history + [dict(final, close=98, taker_buy_volume=1400)], btc)
+        self.assertIsNotNone(short)
+        message = format_anomaly(short)
+        self.assertIn("Я бы рассматривал SHORT", message)
+        self.assertIn("агрессивные продажи 80.0%", message)
+        self.assertIn("удержания сопротивления", message)
         self.assertIsNone(anomaly("EXMUSDT", history + [final], []))
         self.assertIsNone(anomaly("EXMUSDT", history + [dict(final, taker_buy_volume=3500)], btc))
         self.assertIsNone(anomaly("EXMUSDT", history + [final], [dict(btc[0], close=102)]))
