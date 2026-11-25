@@ -302,6 +302,10 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
                 "text": message,
                 "disable_web_page_preview": True,
             }
+            # New signal cards only: old queued plaintext and other alerts stay unchanged.
+            header = message.splitlines()[0] if message else ""
+            if header in {"🟢 BOGDAN INTELLIGENCE | LONG", "🔴 BOGDAN INTELLIGENCE | SHORT"} and "\n\n<b>" in message:
+                payload["parse_mode"] = "HTML"
             recipient_delivered = False
             for attempt in range(4):
                 delay_to_rate_limit = 1.1 - (time.monotonic() - telegram_last_sent)

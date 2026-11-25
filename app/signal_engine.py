@@ -5,6 +5,7 @@ Signals are informational only. No orders are placed.
 from collections import deque
 from datetime import datetime, timezone
 from statistics import mean
+from html import escape
 
 from app.analyst import analyst_lines
 
@@ -225,34 +226,79 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, diagnostics=None):
 
 
 def format_signal(signal):
+    """Render a Telegram HTML card, preserving the allowlisted plain header."""
     side = signal["side"]
     icon = "🟢" if side == "LONG" else "🔴"
-    targets = signal["targets"]
+    direction = 1 if side == "LONG" else -1
+    arrow = "↗" if side == "LONG" else "↘"
+    square = "🟩" if side == "LONG" else "🟥"
+    entry = signal["entry"]
+    stop = signal["stop"]
+    score = signal["confidence"]
+    filled = max(0, min(10, int(score / 10 + 0.5)))
+    symbol = signal["symbol"]
+    pair = symbol[:-4] + "/USDT" if symbol.endswith("USDT") else symbol
+    separator = "━━━━━━━━━━━━━━━━━━"
+    candle_time = signal["candle_time"]
+    try:
+        from zoneinfo import ZoneInfo
+        utc = datetime.strptime(candle_time, "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc)
+        local_time = utc.astimezone(ZoneInfo("Europe/Kyiv")).strftime("%d.%m.%Y · %H:%M")
+        time_label = local_time + " (Киев)"
+    except (ValueError, KeyError):
+        time_label = candle_time
+
+    def price(value):
+        return "<code>" + escape(_fmt_price(value)) + "</code>"
+
     lines = [
         f"{icon} BOGDAN INTELLIGENCE | {side}",
         "",
-        f"Актив: {signal['symbol']}",
-        f"Вход: {_fmt_price(signal['entry'])}",
-        f"Рабочая зона: {_fmt_price(signal['entry_zone'][0])} – {_fmt_price(signal['entry_zone'][1])}",
-        f"Stop Loss: {_fmt_price(signal['stop'])}",
-        f"Take Profit 1: {_fmt_price(targets[0])}  (0.8R, закрыть 70%)",
-        f"Take Profit 2: {_fmt_price(targets[1])}  (1.5R, закрыть 20%)",
-        f"Take Profit 3: {_fmt_price(targets[2])}  (2.2R, остаток 10% / trailing)",
-        "",
-        f"Оценка условий: {signal['confidence']}/100",
-        f"Риск до стопа: {signal['risk_pct']:.2f}%",
-        "",
-        "Почему сигнал:",
+        f"<b>{escape(pair)} · {side} {arrow}</b>",
+        f"<i>BINANCE FUTURES | {escape(time_label)}</i>",
+        separator,
+        f"📊 <b>Оценка сигнала: {score}/100</b>",
+        square * filled + "⬜" * (10 - filled),
+        separator,
+        "📍 <b>Точка входа</b>",
+        f"Цена: {price(entry)}",
+        f"Зона: {price(signal['entry_zone'][0])} – {price(signal['entry_zone'][1])}",
+        separator,
+        "🎯 <b>Цели позиции</b>",
     ]
-    lines.extend(f"• {reason}" for reason in signal["reasons"])
-    lines.extend(analyst_lines(signal))
-    boundary = "или ниже" if side == "LONG" else "или выше"
-    lines.append(f"Сценарий отменён при цене {_fmt_price(signal['stop'])} {boundary}.")
+    for i, (target, multiple, portion) in enumerate(zip(
+            signal["targets"], signal.get("target_r", (0.8, 1.5, 2.2)), (70, 20, 10)), 1):
+        move = direction * (target - entry) / entry * 100
+        trailing = " / trailing" if i == 3 else ""
+        lines.append(f"<b>Take Profit {i}</b> {price(target)} · {move:+.2f}% · {portion}% ({multiple:g}R{trailing})")
     lines.extend([
         "",
-        f"Свеча закрылась: {signal['candle_time']}",
-        "Не догонять цену за пределами рабочей зоны",
-        "Рынок: Binance USDⓈ-M Futures",
-        "Режим: наблюдение, без открытия сделок",
+        f"🛑 <b>Stop Loss:</b> {price(stop)} · −{signal['risk_pct']:.2f}%",
+        separator,
+        "📈 <b>Анализ рынка</b>",
+    ])
+    lines.extend("• " + escape(reason) for reason in signal["reasons"])
+    lines.append("")
+    buy = signal.get("market_context", {}).get("buy_share")
+    if buy is not None:
+        buy_blocks = max(0, min(10, int(buy / 10 + 0.5)))
+        lines.extend([
+            "<b>Поток исполнений · 5m</b>",
+            "🟩" * buy_blocks + "🟥" * (10 - buy_blocks),
+            f"Покупки {buy:.1f}% | Продажи {100-buy:.1f}%",
+            "",
+        ])
+    for line in analyst_lines(signal):
+        if line.startswith("Исполнения 5m:"):
+            continue
+        prefix = "⚠️ " if line.startswith(("Сигналы расходятся:", "Оба фактора против")) else ""
+        lines.append(prefix + escape(line))
+    boundary = "или ниже" if side == "LONG" else "или выше"
+    lines.extend([
+        separator,
+        "⚠️ Вход только внутри рабочей зоны.",
+        f"Отмена сценария: {price(stop)} {boundary}.",
+        f"<i>Свеча закрылась: {escape(candle_time)}</i>",
+        "<i>🔒 Режим: наблюдение, без открытия сделок</i>",
     ])
     return "\n".join(lines)
