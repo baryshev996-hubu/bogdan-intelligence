@@ -37,6 +37,25 @@ paper_sprint_book = PaperBook(
     label="10-hour sprint v2",
 )
 
+# Independent 10-hour PAPER sprint v3: same setup and risk, 5x notional cap,
+# automatic net breakeven protection, and early profit capture on strong impulses.
+SPRINT_V3_STARTED_AT = int(time.time())
+SPRINT_V3_ENDS_AT = SPRINT_V3_STARTED_AT + 10 * 60 * 60
+paper_sprint_v3_book = PaperBook(
+    path="/data/paper_sprint_v3_5x_20261125.json",
+    start_balance=100.0,
+    risk_fraction=0.005,
+    max_open=2,
+    max_gross_leverage=5.0,
+    fee_rate=0.0005,
+    ends_at=SPRINT_V3_ENDS_AT,
+    label="10-hour sprint v3 5x",
+    breakeven_trigger_r=0.50,
+    impulse_exit_r=0.55,
+    impulse_body_ratio=0.65,
+    impulse_close_position=0.20,
+)
+
 # Isolated order-book PAPER challenge. Kyiv 20:00 on 25 Nov 2026 = 18:00 UTC.
 orderflow_paper_book = PaperBook(
     path="/data/orderflow_paper_20261125.json",
@@ -213,6 +232,11 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
     }
 
     async with telegram_send_lock:
+        # Recheck after acquiring the lock. If a concurrent request discovered
+        # a revoked token, queued messages must not generate a 401 storm.
+        if telegram_auth_valid is not True:
+            log.warning("TELEGRAM BLOCKED | token authentication is invalid; awaiting credential rotation")
+            return False
         for attempt in range(4):
             delay_to_rate_limit = 1.1 - (time.monotonic() - telegram_last_sent)
             if delay_to_rate_limit > 0:
@@ -510,7 +534,26 @@ async def binance_signal_monitor(session, symbols):
 
                     paper_book.on_candle(symbol, candle)
                     paper_sprint_book.on_candle(symbol, candle)
+                    paper_sprint_v3_book.on_candle(symbol, candle)
                     orderflow_paper_book.on_candle(symbol, candle)
+
+                    # Sprint V3 uses the same unfiltered MTF signal as V2,
+                    # but its exits and 5x cap are isolated in a separate ledger.
+                    if paper_sprint_v3_book.active():
+                        sprint_v3_signal = evaluate(
+                            symbol, histories[symbol], apply_reversal_filter=False
+                        )
+                        if sprint_v3_signal:
+                            sprint_v3_signal = dict(sprint_v3_signal)
+                            sprint_v3_signal["paper_slippage_rate"] = 0.0001
+                            sprint_v3_signal["paper_management_version"] = 3
+                            sprint_v3_signal["paper_max_gross_leverage"] = 5.0
+                            sprint_v3_opened = paper_sprint_v3_book.open_trade(sprint_v3_signal)
+                            if sprint_v3_opened:
+                                log.info(
+                                    "PAPER SPRINT V3 OPENED | %s %s | risk=0.50%% | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | status=%s",
+                                    sprint_v3_signal["side"], symbol, paper_sprint_v3_book.status()
+                                )
 
                     # The sprint tests the proven baseline MTF setup independently.
                     # The main PAPER book keeps its existing 1m reversal filter.
@@ -554,6 +597,8 @@ async def main():
     log.info("PAPER TRADING | %s", paper_book.status())
     log.info("PAPER SPRINT V2 | %s | risk=0.50%% | max_open=2 | leverage_cap=3x | ends_at=%s",
              paper_sprint_book.status(), SPRINT_ENDS_AT)
+    log.info("PAPER SPRINT V3 5X | %s | risk=0.50%% | max_open=2 | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | ends_at=%s",
+             paper_sprint_v3_book.status(), SPRINT_V3_ENDS_AT)
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
 
