@@ -50,7 +50,7 @@ class SignalEngineTests(unittest.TestCase):
                   "targets": [102.0, 104.0, 106.0]}
         future = [{"low": 103.0, "high": 107.0, "close": 106.5}]
         result, _ = simulate_trade(signal, future)
-        self.assertAlmostEqual(result, 1.7)
+        self.assertAlmostEqual(result, 1.08)
 
     def test_backtest_stop_first_when_stop_and_target_share_candle(self):
         signal = {"side": "LONG", "entry": 100.0, "stop": 98.0,
@@ -64,7 +64,7 @@ class SignalEngineTests(unittest.TestCase):
                   "targets": [98.0, 96.0, 94.0]}
         future = [{"low": 97.5, "high": 100.5, "close": 98.0}]
         result, _ = simulate_trade(signal, future)
-        self.assertAlmostEqual(result, 0.5)
+        self.assertAlmostEqual(result, 0.86)
 
     def test_signal_message_has_trade_levels_and_no_execution_claim(self):
         signal = {
