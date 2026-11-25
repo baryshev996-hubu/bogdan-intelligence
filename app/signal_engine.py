@@ -280,12 +280,10 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=T
 
 
 def confirm_signal_with_1m(signal, candle):
-    """Veto a strong 1m reversal, otherwise reprice the pending entry at the 1m close."""
+    """Veto a 1m candle that closes against the proposed entry, then reprice."""
     entry = float(signal["entry"])
     open_price = float(candle["open"])
     close_price = float(candle["close"])
-    candle_range = max(float(candle["high"]) - float(candle["low"]), close_price * 1e-9)
-    body_ratio = abs(close_price - open_price) / candle_range
     risk = abs(entry - float(signal["stop"]))
     if risk <= 0:
         return None
@@ -294,15 +292,14 @@ def confirm_signal_with_1m(signal, candle):
     if abs(delta) > 0.25 * risk:
         return None
 
-    strong_countertrend = body_ratio >= 0.40
     if signal["side"] == "SHORT":
-        if strong_countertrend and close_price > open_price and close_price > entry:
+        if close_price > open_price and close_price > entry:
             return None
-        direction_text = "1m не подтвердил сильный разворот вверх, вход переоценён по закрытию"
+        direction_text = "1m close did not break upward through the SHORT entry"
     else:
-        if strong_countertrend and close_price < open_price and close_price < entry:
+        if close_price < open_price and close_price < entry:
             return None
-        direction_text = "1m не подтвердил сильный разворот вниз, вход переоценён по закрытию"
+        direction_text = "1m close did not break downward through the LONG entry"
 
     adjusted = dict(signal)
     adjusted["entry"] = close_price
