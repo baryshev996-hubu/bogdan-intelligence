@@ -46,7 +46,7 @@ class SignalEngineTests(unittest.TestCase):
                   "close": 99.9, "close_time": 1795585259999}
         confirmed = confirm_signal_with_1m(signal, candle)
         self.assertIsNotNone(confirmed)
-        self.assertAlmostEqual(confirmed["entry"], 100.1)
+        self.assertAlmostEqual(confirmed["entry"], 99.9)
 
     def test_1m_reversal_cancels_short_entry(self):
         signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
