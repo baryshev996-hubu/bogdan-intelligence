@@ -27,6 +27,7 @@ from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
 from app.upcoming_listings import run_upcoming_listings_monitor
+from app.early_intelligence import ENABLED as ENABLE_EARLY_INTEL, observe_candles, run_early_intelligence
 
 # Isolated 10-hour sprint v2. Uses the baseline MTF setup without the
 # baseline multi-timeframe setup. Separate ledger; no effect on main PAPER.
@@ -238,6 +239,9 @@ def is_allowed_telegram_alert(message: str) -> bool:
     if normalized.startswith("ORDER FLOW INTELLIGENCE |"):
         return True
 
+    if header == "🕵️ BOGDAN INTELLIGENCE | EARLY INTELLIGENCE":
+        return True
+
     if normalized.startswith("BOGDAN INTELLIGENCE | 🟢 FLOW CONFIRMED |"):
         return True
     if normalized.startswith("BOGDAN INTELLIGENCE | 🟡 POSSIBLE ABSORPTION |"):
@@ -310,7 +314,8 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
             ))
             is_order_flow_card = header.startswith("🧭 ORDER FLOW INTELLIGENCE | ")
             is_listing_card = header == "🚨 BOGDAN INTELLIGENCE | UPCOMING LISTING"
-            if (is_signal_card or is_whale_card or is_order_flow_card or is_listing_card) and "\n\n<b>" in message:
+            is_early_card = header == "🕵️ BOGDAN INTELLIGENCE | EARLY INTELLIGENCE"
+            if (is_signal_card or is_whale_card or is_order_flow_card or is_listing_card or is_early_card) and "\n\n<b>" in message:
                 payload["parse_mode"] = "HTML"
             recipient_delivered = False
             for attempt in range(4):
@@ -637,6 +642,12 @@ async def binance_signal_monitor(session, symbols):
                         sprint_signal["side"], symbol, paper_sprint_book.status()
                     )
 
+        if ENABLE_EARLY_INTEL:
+            try:
+                observe_candles(symbol, histories[symbol]["5m"], histories.get("BTCUSDT", {}).get("5m", ()))
+            except Exception:
+                log.exception("EARLY INTELLIGENCE candle observation failed | %s", symbol)
+
         scan_evaluations += 1
         signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
         if signal:
@@ -751,7 +762,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=40)
 
     log.info("BOOT | strict Telegram allowlist enabled | telegram_recipients=%d", len(CHAT_IDS))
-    log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS")
+    log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS, EARLY INTELLIGENCE")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
     log.info("SIGNAL DELIVERY | enabled=%s | one signal per closed candle | recipients=%d",
              ENABLE_SIGNAL_DELIVERY, len(CHAT_IDS))
@@ -795,6 +806,9 @@ async def main():
             tasks.append(run_upcoming_listings_monitor(session))
         else:
             log.info("UPCOMING LISTINGS disabled by ENABLE_UPCOMING_LISTINGS=false")
+
+        if ENABLE_EARLY_INTEL:
+            tasks.append(run_early_intelligence(session, telegram_send))
 
         if ENABLE_ARKHAM:
             # Optional Arkham API monitor remains disabled unless explicitly enabled.
