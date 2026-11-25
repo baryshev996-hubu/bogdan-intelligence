@@ -32,3 +32,5 @@ if __name__ == "__main__":
 # Research branch trigger: rerun the isolated A/B workflow on this commit.
 
 # Trigger A-B runner after package-path correction.
+
+# Trigger archive-source connectivity check.
