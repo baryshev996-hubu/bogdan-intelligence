@@ -313,6 +313,55 @@ def confirm_signal_with_1m(signal, candle):
 
 
 
+
+def confirm_signal_with_1m_window(signal, candles):
+    """Confirm or veto a setup using two consecutive closed 1m candles."""
+    if len(candles) < 2:
+        return None
+    first, last = candles[0], candles[1]
+    if int(last["close_time"]) <= int(first["close_time"]):
+        return None
+    if int(last["close_time"]) - int(first["close_time"]) > 120_000:
+        return None
+
+    entry = float(signal["entry"])
+    first_open = float(first["open"])
+    last_close = float(last["close"])
+    delta = last_close - entry
+
+    if signal["side"] == "SHORT":
+        reversal = (
+            all(float(c["close"]) > float(c["open"]) for c in candles[:2])
+            and last_close > entry
+            and last_close > first_open
+        )
+        if reversal:
+            return None
+        direction_text = "two 1m closes did not confirm an upward reversal through SHORT entry"
+    else:
+        reversal = (
+            all(float(c["close"]) < float(c["open"]) for c in candles[:2])
+            and last_close < entry
+            and last_close < first_open
+        )
+        if reversal:
+            return None
+        direction_text = "two 1m closes did not confirm a downward reversal through LONG entry"
+
+    adjusted = dict(signal)
+    adjusted["entry"] = last_close
+    adjusted["stop"] = float(signal["stop"]) + delta
+    adjusted["targets"] = [float(target) + delta for target in signal["targets"]]
+    adjusted["entry_zone"] = [float(level) + delta for level in signal["entry_zone"]]
+    adjusted["risk_pct"] = abs(adjusted["entry"] - adjusted["stop"]) / adjusted["entry"] * 100
+    adjusted["entry_time"] = int(last["close_time"])
+    adjusted["candle_time"] = datetime.fromtimestamp(
+        int(last["close_time"]) / 1000, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    adjusted["reasons"] = list(signal.get("reasons", [])) + [direction_text]
+    return adjusted
+
+
 def format_signal(signal):
     side = signal["side"]
     icon = "🟢" if side == "LONG" else "🔴"
