@@ -66,6 +66,22 @@ orderflow_paper_book = PaperBook(
     label="ORDERFLOW 200 USD challenge",
 )
 
+# Independent 10-day leverage paper challenge. $20 margin per trade,
+# 10-20x leverage, <=0.25% account risk, five concurrent positions.
+leverage_paper_book = PaperBook(
+    path="/data/paper_leverage_200_20261125.json",
+    start_balance=200.0,
+    risk_fraction=0.0025,
+    max_open=5,
+    max_gross_leverage=20.0,
+    fee_rate=0.0005,
+    label="LEVERAGE 200 USD / 20 USD margin challenge",
+    breakeven_trigger_r=0.50,
+    impulse_exit_r=100.0,
+    impulse_body_ratio=0.99,
+    impulse_close_position=0.01,
+)
+
 load_dotenv()
 
 logging.basicConfig(
@@ -410,6 +426,34 @@ async def discover_trading_universe(session):
         return sorted(pinned)
 
 
+def build_leverage_paper_signal(signal, balance):
+    """Size a virtual $20-margin position while capping planned loss at 0.25% equity."""
+    entry = float(signal["entry"])
+    if entry <= 0:
+        return None
+    confidence = int(signal.get("confidence", 0))
+    leverage = 10 if confidence < 80 else 15 if confidence < 85 else 20
+    notional = 20.0 * leverage
+    quantity = notional / entry
+    risk_budget = max(0.0, float(balance)) * 0.0025
+    if risk_budget <= 0 or quantity <= 0:
+        return None
+    direction = 1.0 if signal["side"] == "LONG" else -1.0
+    stop_distance = risk_budget / quantity
+    prepared = dict(signal)
+    prepared["stop"] = entry - direction * stop_distance
+    prepared["targets"] = [
+        entry + direction * 0.0100 * entry,
+        entry + direction * 0.0125 * entry,
+        entry + direction * 0.0150 * entry,
+    ]
+    prepared["paper_management_version"] = 3
+    prepared["paper_max_gross_leverage"] = 20.0
+    prepared["paper_slippage_rate"] = 0.0001
+    prepared["paper_leverage"] = leverage
+    return prepared
+
+
 async def binance_signal_monitor(session, symbols):
     if not symbols:
         log.error("Signal engine stopped: no Binance USD-M Futures symbols configured.")
@@ -452,6 +496,16 @@ async def binance_signal_monitor(session, symbols):
             opened = paper_book.open_trade(signal)
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
+        if leverage_paper_book.active():
+            leverage_signal = build_leverage_paper_signal(signal, leverage_paper_book.state["balance"])
+            if leverage_signal:
+                leverage_opened = leverage_paper_book.open_trade(leverage_signal)
+                if leverage_opened:
+                    log.info(
+                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | margin=$20 | leverage=%sx | risk<=0.25%% | TP=1.00/1.25/1.50%% | status=%s",
+                        leverage_signal["side"], symbol, leverage_signal["paper_leverage"],
+                        leverage_paper_book.status()
+                    )
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
         if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
@@ -536,6 +590,7 @@ async def binance_signal_monitor(session, symbols):
         now_mono = time.monotonic()
         # Keep existing PAPER challenges on their original 30-symbol
         # sample while production signal delivery scans the expanded top 100.
+        leverage_paper_book.on_candle(symbol, candle)
         if symbol in PAPER_TEST_SYMBOLS:
             paper_book.on_candle(symbol, candle)
             paper_sprint_book.on_candle(symbol, candle)
@@ -684,6 +739,8 @@ async def main():
              paper_sprint_v3_book.status(), SPRINT_V3_ENDS_AT)
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
+    log.info("PAPER LEVERAGE CHALLENGE | %s | margin_per_trade=$20 | leverage=10-20x | risk=0.25%% | max_open=5 | TP=1.00/1.25/1.50%%",
+             leverage_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         auth_ok = await validate_telegram_auth(session)
