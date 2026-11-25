@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
-from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi
+from app.signal_engine import atr, ema, evaluate, format_signal, macd_histogram, rsi, _reversal_conflict
 from app.backtest import simulate_trade
 
 
@@ -25,6 +25,36 @@ class SignalEngineTests(unittest.TestCase):
     def test_macd_returns_value_with_enough_data(self):
         values = [100 + i * 0.1 + (i % 4) * 0.03 for i in range(80)]
         self.assertIsNotNone(macd_histogram(values))
+
+    def test_confirmed_upward_reversal_blocks_short(self):
+        candles = []
+        for i in range(24):
+            low = 99.0 + i * 0.02 if i >= 20 else 99.0
+            candles.append({"open": 99.8, "high": 100.5, "low": low,
+                            "close": 100.0, "volume": 100.0})
+        candles[-1] = {"open": 100.0, "high": 102.5, "low": 100.0,
+                       "close": 102.0, "volume": 200.0}
+        blocked, _ = _reversal_conflict(candles, "SHORT")
+        self.assertTrue(blocked)
+
+    def test_confirmed_downward_reversal_blocks_long(self):
+        candles = []
+        for i in range(24):
+            high = 101.0 - i * 0.02 if i >= 20 else 101.0
+            candles.append({"open": 100.2, "high": high, "low": 99.5,
+                            "close": 100.0, "volume": 100.0})
+        candles[-1] = {"open": 100.0, "high": 100.0, "low": 97.5,
+                       "close": 98.0, "volume": 200.0}
+        blocked, _ = _reversal_conflict(candles, "LONG")
+        self.assertTrue(blocked)
+
+    def test_single_opposite_candle_does_not_confirm_reversal(self):
+        candles = [{"open": 100.0, "high": 101.0, "low": 99.0,
+                    "close": 100.2, "volume": 100.0} for _ in range(24)]
+        candles[-1] = {"open": 100.0, "high": 100.5, "low": 99.8,
+                       "close": 100.4, "volume": 110.0}
+        blocked, _ = _reversal_conflict(candles, "SHORT")
+        self.assertFalse(blocked)
 
     def test_insufficient_history_never_emits_signal(self):
         self.assertIsNone(evaluate("BTCUSDT", {"5m": [], "15m": [], "1h": []}))
