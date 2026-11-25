@@ -91,7 +91,14 @@ logging.basicConfig(
 log = logging.getLogger("bogdan-intel")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Support multiple Telegram recipients while preserving the legacy single-chat variable.
+CHAT_IDS = list(dict.fromkeys(
+    item.strip()
+    for item in (
+        os.getenv("TELEGRAM_CHAT_IDS", "") + "," + os.getenv("TELEGRAM_CHAT_ID", "")
+    ).split(",")
+    if item.strip()
+))
 
 BINANCE_SYMBOLS = [
     item.strip().upper()
@@ -242,7 +249,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
 
 
 async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
-    """Send only allowlisted alerts, with serialization and bounded retries."""
+    """Send an allowlisted alert to every configured Telegram recipient."""
     global telegram_last_sent, telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
 
     if not is_allowed_telegram_alert(message):
@@ -251,8 +258,15 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
         return False
 
     refresh_telegram_token_from_environment()
-    if not BOT_TOKEN or not CHAT_ID:
-        log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
+    recipients = list(dict.fromkeys(
+        item.strip()
+        for item in (
+            os.getenv("TELEGRAM_CHAT_IDS", "") + "," + os.getenv("TELEGRAM_CHAT_ID", "")
+        ).split(",")
+        if item.strip()
+    ))
+    if not BOT_TOKEN or not recipients:
+        log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and at least one Telegram chat ID.")
         return False
     if telegram_auth_valid is not True:
         age = time.monotonic() - telegram_auth_checked_at
@@ -264,74 +278,86 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
             return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
+    any_delivered = False
 
     async with telegram_send_lock:
-        # Recheck after acquiring the lock. If a concurrent request discovered
-        # a revoked token, queued messages must not generate a 401 storm.
         if telegram_auth_valid is not True:
             log.warning("TELEGRAM BLOCKED | token authentication is invalid; awaiting credential rotation")
             return False
-        for attempt in range(4):
-            delay_to_rate_limit = 1.1 - (time.monotonic() - telegram_last_sent)
-            if delay_to_rate_limit > 0:
-                await asyncio.sleep(delay_to_rate_limit)
 
-            try:
-                async with session.post(url, json=payload, timeout=20) as response:
-                    body = await response.json(content_type=None)
-                    telegram_last_sent = time.monotonic()
+        for recipient in recipients:
+            payload = {
+                "chat_id": recipient,
+                "text": message,
+                "disable_web_page_preview": True,
+            }
+            recipient_delivered = False
+            for attempt in range(4):
+                delay_to_rate_limit = 1.1 - (time.monotonic() - telegram_last_sent)
+                if delay_to_rate_limit > 0:
+                    await asyncio.sleep(delay_to_rate_limit)
 
-                    if response.status == 200 and body.get("ok") is True:
-                        log.info("TELEGRAM SENT | header=%r", message.splitlines()[0][:100])
-                        return True
+                try:
+                    async with session.post(url, json=payload, timeout=20) as response:
+                        body = await response.json(content_type=None)
+                        telegram_last_sent = time.monotonic()
 
-                    if response.status == 429:
-                        retry_after = body.get("parameters", {}).get("retry_after", 2)
-                        try:
-                            retry_after = max(1, min(int(retry_after), 60))
-                        except (TypeError, ValueError):
-                            retry_after = 2
-                        if attempt < 3:
-                            log.warning("Telegram rate limited; retrying after %ss", retry_after)
-                            await asyncio.sleep(retry_after)
+                        if response.status == 200 and body.get("ok") is True:
+                            log.info("TELEGRAM SENT | recipient_suffix=%s | header=%r",
+                                     recipient[-4:], message.splitlines()[0][:100])
+                            recipient_delivered = True
+                            any_delivered = True
+                            break
+
+                        if response.status == 429:
+                            retry_after = body.get("parameters", {}).get("retry_after", 2)
+                            try:
+                                retry_after = max(1, min(int(retry_after), 60))
+                            except (TypeError, ValueError):
+                                retry_after = 2
+                            if attempt < 3:
+                                log.warning("Telegram rate limited; retrying after %ss", retry_after)
+                                await asyncio.sleep(retry_after)
+                                continue
+
+                        if response.status >= 500 and attempt < 3:
+                            backoff = min(2 ** attempt, 15)
+                            log.warning("Telegram HTTP %s; retrying in %ss", response.status, backoff)
+                            await asyncio.sleep(backoff)
                             continue
 
-                    if response.status >= 500 and attempt < 3:
-                        backoff = min(2 ** attempt, 15)
-                        log.warning("Telegram HTTP %s; retrying in %ss", response.status, backoff)
-                        await asyncio.sleep(backoff)
-                        continue
+                        if response.status == 401:
+                            telegram_auth_valid = False
+                            telegram_auth_checked_at = time.monotonic()
+                            telegram_hard_auth_failure = True
+                            log.critical(
+                                "TELEGRAM AUTH CIRCUIT OPEN | send endpoint rejected the configured credential. "
+                                "Queued sends are blocked and automatic retries are disabled until token rotation."
+                            )
+                            return any_delivered
 
-                    if response.status == 401:
-                        telegram_auth_valid = False
-                        telegram_auth_checked_at = time.monotonic()
-                        telegram_hard_auth_failure = True
-                        log.critical(
-                            "TELEGRAM AUTH CIRCUIT OPEN | send endpoint rejected the configured credential. "
-                            "Queued sends are blocked and automatic retries are disabled until token rotation."
-                        )
-                        return False
+                        description = body.get("description", "unknown Telegram API error")
+                        log.error("Telegram delivery failed | recipient_suffix=%s | HTTP %s | %s",
+                                  recipient[-4:], response.status, description)
+                        break
 
-                    log.error("Telegram rejected message: HTTP %s, response=%s", response.status, body)
-                    return False
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    if attempt == 3:
+                        log.exception("Telegram delivery failed after retries | recipient_suffix=%s",
+                                      recipient[-4:])
+                        break
+                    backoff = min(2 ** attempt, 15)
+                    log.warning("Telegram network error; retrying in %ss", backoff, exc_info=True)
+                    await asyncio.sleep(backoff)
+                except Exception:
+                    log.exception("Unexpected Telegram delivery error | recipient_suffix=%s",
+                                  recipient[-4:])
+                    break
 
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                if attempt == 3:
-                    log.exception("Telegram delivery failed after retries")
-                    return False
-                backoff = min(2 ** attempt, 15)
-                log.warning("Telegram network error; retrying in %ss", backoff, exc_info=True)
-                await asyncio.sleep(backoff)
-            except Exception:
-                log.exception("Unexpected Telegram delivery error")
-                return False
+            if not recipient_delivered:
+                log.warning("TELEGRAM RECIPIENT NOT DELIVERED | recipient_suffix=%s", recipient[-4:])
 
-    return False
+    return any_delivered
 
 
 async def load_binance_history(session, symbol: str, interval: str):
@@ -719,13 +745,13 @@ async def binance_signal_monitor(session, symbols):
 
 
 async def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in Railway variables.")
+    if not BOT_TOKEN or not CHAT_IDS:
+        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or Telegram chat ID in Railway variables.")
 
     timeout = aiohttp.ClientTimeout(total=30)
     connector = aiohttp.TCPConnector(limit=40)
 
-    log.info("BOOT | strict Telegram allowlist enabled")
+    log.info("BOOT | strict Telegram allowlist enabled | telegram_recipients=%d", len(CHAT_IDS))
     log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
     log.info("SIGNAL DELIVERY | enabled=%s | scope=%s | same_side_cooldown=%ss | flip_cooldown=%ss",
