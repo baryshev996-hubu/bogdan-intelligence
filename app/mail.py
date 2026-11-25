@@ -589,7 +589,7 @@ async def binance_signal_monitor(session, symbols):
                                 )
 
                     # The sprint tests the proven baseline MTF setup independently.
-                    # The main PAPER book keeps its existing 1m reversal filter.
+                    # The main PAPER book also uses the baseline MTF setup without the 1m reversal veto.
                     if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
                         sprint_signal = evaluate(
                             symbol, histories[symbol], apply_reversal_filter=False
@@ -604,7 +604,7 @@ async def binance_signal_monitor(session, symbols):
                                     sprint_signal["side"], symbol, paper_sprint_book.status()
                                 )
 
-                    signal = evaluate(symbol, histories[symbol])
+                    signal = evaluate(symbol, histories[symbol], apply_reversal_filter=False)
                     if signal:
                         await dispatch_signal(signal)
 
