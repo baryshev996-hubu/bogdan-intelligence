@@ -1,0 +1,51 @@
+name: Reversal filter historical A-B test
+
+on:
+  push:
+    branches:
+      - research/reversal-filter-backtest
+    paths:
+      - "app/reversal_filter.py"
+      - "scripts/backtest_reversal.py"
+      - "tests/test_reversal_filter.py"
+      - ".github/workflows/reversal-backtest.yml"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Historical lookback in days
+        required: false
+        default: "60"
+      universe:
+        description: "30 configured liquid pairs or top 100 USDT perpetuals"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: research/reversal-filter-backtest
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest tests.test_reversal_filter -v
+      - name: Run historical A-B backtest
+        env:
+          DAYS: ${{ github.event.inputs.days || '60' }}
+          UNIVERSE: ${{ github.event.inputs.universe || '30' }}
+        run: python scripts/backtest_reversal.py --days "$DAYS" --symbols "$UNIVERSE" --output reversal_backtest.json
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reversal-backtest-report
+          path: reversal_backtest.json
+          retention-days: 30
