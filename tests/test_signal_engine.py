@@ -42,8 +42,8 @@ class SignalEngineTests(unittest.TestCase):
         signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
                   "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
                   "risk_pct": 2.0, "reasons": []}
-        candle = {"open": 100.0, "high": 100.2, "low": 99.9,
-                  "close": 100.1, "close_time": 1795585259999}
+        candle = {"open": 99.8, "high": 100.1, "low": 99.7,
+                  "close": 99.9, "close_time": 1795585259999}
         confirmed = confirm_signal_with_1m(signal, candle)
         self.assertIsNotNone(confirmed)
         self.assertAlmostEqual(confirmed["entry"], 100.1)
@@ -54,6 +54,14 @@ class SignalEngineTests(unittest.TestCase):
                   "risk_pct": 2.0, "reasons": []}
         candle = {"open": 100.0, "high": 100.5, "low": 99.9,
                   "close": 100.4, "close_time": 1795585259999}
+        self.assertIsNone(confirm_signal_with_1m(signal, candle))
+
+    def test_weak_bullish_1m_close_above_short_entry_is_vetoed(self):
+        signal = {"side": "SHORT", "entry": 100.0, "stop": 102.0,
+                  "targets": [98.0, 97.0, 95.0], "entry_zone": [99.5, 100.5],
+                  "risk_pct": 2.0, "reasons": []}
+        candle = {"open": 100.0, "high": 100.2, "low": 99.9,
+                  "close": 100.1, "close_time": 1795585259999}
         self.assertIsNone(confirm_signal_with_1m(signal, candle))
 
     def test_1m_confirmation_reprices_long_entry(self):
