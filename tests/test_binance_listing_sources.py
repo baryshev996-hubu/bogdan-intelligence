@@ -20,6 +20,10 @@ class BinanceSourceTests(unittest.TestCase):
         self.assertEqual(events[0]["ticker"], "EXM")
         self.assertEqual(events[0]["id"], "binance:" + "a" * 32)
         self.assertEqual(events[0]["when"].hour, 12)
+        page = post("Binance Will List Example (EXM)",
+                    "Deposits open 2026-12-01 10:00 UTC.<br>Trading starts 2026-12-01 12:30 UTC.")
+        events, _ = _telegram_listing_events(page)
+        self.assertEqual(events[0]["when"].hour, 12)
 
     def test_excludes_equities_and_nonlisting(self):
         page = post("Binance Futures Will Launch TradFi ABCUSDT Perpetual Contract",

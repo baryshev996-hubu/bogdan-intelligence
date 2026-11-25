@@ -330,7 +330,10 @@ def _telegram_listing_events(page):
             continue
         when = None
         for line in lines[1:]:
-            if re.search(r"\b(?:trad(?:e|ing)|launch|list(?:ing)?|open)\b", line, re.I):
+            # A deposit/withdrawal opening is not a trading launch.
+            if re.search(r"\b(?:deposits?|withdrawals?)\b", line, re.I):
+                continue
+            if re.search(r"\b(?:trad(?:e|ing)|launch|list(?:ing)?)\b", line, re.I):
                 when = _parse_explicit_utc(line)
                 if when:
                     break
