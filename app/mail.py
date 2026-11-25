@@ -509,171 +509,136 @@ async def binance_signal_monitor(session, symbols):
         for timeframe in INTERVALS
     ))
 
-    streams = [
-        f"{symbol.lower()}@kline_{timeframe}"
-        for symbol in symbols
-        for timeframe in INTERVALS
-    ]
-    # Use Binance's combined-stream endpoint instead of raw /ws SUBSCRIBE.
-    # The raw endpoint acknowledged every batch but produced no market events
-    # in production. A combined stream carries market data in packet["data"].
-    # 300 streams (100 symbols x 3 intervals) remain below Binance's 1024 limit.
-    url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
-    log.info("BINANCE WS CONFIG | symbols=%d | streams=%d | url_length=%d | mode=combined",
-             len(symbols), len(streams), len(url))
+    # Binance WebSocket sessions in this Railway region establish but deliver
+    # zero market events. Use public REST klines as the reliable market-data source.
+    # 300 limit=3 requests every 20 seconds remain within Binance rate limits.
+    async def process_closed_5m_candle(symbol, candle):
+        nonlocal scan_evaluations, scan_signals, last_scan_report
+        now_mono = time.monotonic()
+                # Keep existing PAPER challenges on their original 30-symbol
+                # sample while production signal delivery scans the expanded top 100.
+                if symbol in PAPER_TEST_SYMBOLS:
+                    paper_book.on_candle(symbol, candle)
+                    paper_sprint_book.on_candle(symbol, candle)
+                    paper_sprint_v3_book.on_candle(symbol, candle)
+                    orderflow_paper_book.on_candle(symbol, candle)
+        
+                # Sprint V3 uses the same unfiltered MTF signal as V2,
+                # but its exits and 5x cap are isolated in a separate ledger.
+                if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
+                    sprint_v3_signal = evaluate(symbol, histories[symbol])
+                    if sprint_v3_signal:
+                        sprint_v3_signal = dict(sprint_v3_signal)
+                        sprint_v3_signal["paper_slippage_rate"] = 0.0001
+                        sprint_v3_signal["paper_management_version"] = 3
+                        sprint_v3_signal["paper_max_gross_leverage"] = 5.0
+                        sprint_v3_opened = paper_sprint_v3_book.open_trade(sprint_v3_signal)
+                        if sprint_v3_opened:
+                            log.info(
+                                "PAPER SPRINT V3 OPENED | %s %s | risk=0.50%% | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | status=%s",
+                                sprint_v3_signal["side"], symbol, paper_sprint_v3_book.status()
+                            )
+        
+                # The sprint tests the proven baseline MTF setup independently.
+                # The main PAPER book uses the same baseline MTF setup.
+                if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
+                    sprint_signal = evaluate(symbol, histories[symbol])
+                    if sprint_signal:
+                        sprint_signal = dict(sprint_signal)
+                        sprint_signal["paper_slippage_rate"] = 0.0001
+                        sprint_opened = paper_sprint_book.open_trade(sprint_signal)
+                        if sprint_opened:
+                            log.info(
+                                "PAPER SPRINT V2 OPENED | %s %s | risk=0.50%% | slippage=0.010%% | status=%s",
+                                sprint_signal["side"], symbol, paper_sprint_book.status()
+                            )
+        
+                scan_evaluations += 1
+                signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
+                if signal:
+                    scan_signals += 1
+                    await dispatch_signal(signal)
+        
+                if now_mono - last_scan_report >= 300:
+                    top_rejections = scan_rejections.most_common(6)
+                    log.info(
+                        "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
+                        len(symbols), scan_evaluations, scan_signals,
+                        top_rejections, ",".join(INTERVALS)
+                    )
+                    scan_rejections.clear()
+                    scan_evaluations = 0
+                    scan_signals = 0
+                    last_scan_report = now_mono
+
+    poll_semaphore = asyncio.Semaphore(20)
+    poll_interval_seconds = 20
+    closed_5m_candles = 0
+    last_poll_health = time.monotonic()
+
+    async def poll_symbol_timeframe(symbol, timeframe):
+        nonlocal closed_5m_candles
+        async with poll_semaphore:
+            try:
+                url = "https://fapi.binance.com/fapi/v1/klines"
+                params = {"symbol": symbol, "interval": timeframe, "limit": 3}
+                async with session.get(url, params=params, timeout=15) as response:
+                    response.raise_for_status()
+                    rows = await response.json(content_type=None)
+
+                now_ms = int(time.time() * 1000)
+                history = histories[symbol][timeframe]
+                latest_open_time = history[-1]["open_time"] if history else -1
+                added = 0
+                for row in rows:
+                    candle = {
+                        "open_time": int(row[0]),
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5]),
+                        "close_time": int(row[6]),
+                    }
+                    if candle["close_time"] >= now_ms or candle["open_time"] <= latest_open_time:
+                        continue
+                    store_closed_candle(history, candle)
+                    latest_open_time = candle["open_time"]
+                    added += 1
+                    if timeframe == "5m":
+                        closed_5m_candles += 1
+                        await process_closed_5m_candle(symbol, candle)
+                return True, added
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("BINANCE REST KLINE FAILED | %s | %s | %s: %s",
+                            symbol, timeframe, type(exc).__name__, str(exc)[:140])
+                return False, 0
+
+    log.info("BINANCE REST SCANNER STARTED | symbols=%d | requests_per_cycle=%d | concurrency=20 | cycle=%ss | intervals=%s",
+             len(symbols), len(symbols) * len(INTERVALS), poll_interval_seconds, ",".join(INTERVALS))
 
     while True:
-        try:
-            async with websockets.connect(
-                url,
-                ping_interval=20,
-                ping_timeout=60,
-                close_timeout=10,
-                open_timeout=20,
-                max_size=2**20,
-            ) as websocket:
-                log.info(
-                    "BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | intervals=%s | mode=combined",
-                    len(symbols), len(streams), ",".join(INTERVALS)
-                )
+        cycle_started = time.monotonic()
+        jobs = (
+            poll_symbol_timeframe(symbol, timeframe)
+            for symbol in symbols
+            for timeframe in INTERVALS
+        )
+        results = await asyncio.gather(*jobs)
+        successful = sum(1 for ok, _ in results if ok)
+        failed = len(results) - successful
+        new_candles = sum(count for _, count in results)
+        elapsed = time.monotonic() - cycle_started
 
-                ws_messages = 0
-                closed_candles = 0
-                subscription_acks = 0
-                subscription_rejections = 0
-                last_ws_health = time.monotonic()
-                last_ws_packet_at = last_ws_health
+        if time.monotonic() - last_poll_health >= 60:
+            log.info("BINANCE REST POLL HEALTH | symbols=%d | requests=%d | ok=%d | errors=%d | new_closed_candles=%d | new_5m=%d | cycle_seconds=%.1f",
+                     len(symbols), len(results), successful, failed, new_candles,
+                     closed_5m_candles, elapsed)
+            last_poll_health = time.monotonic()
 
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(websocket.recv(), timeout=45)
-                    except asyncio.TimeoutError:
-                        now_mono = time.monotonic()
-                        idle_seconds = now_mono - last_ws_packet_at
-                        if now_mono - last_ws_health >= 60:
-                            log.warning(
-                                "BINANCE WS HEALTH | messages=%d | closed_candles=%d | subscription_acks=%d | rejected=%d | idle_seconds=%.0f",
-                                ws_messages, closed_candles, subscription_acks,
-                                subscription_rejections, idle_seconds
-                            )
-                            last_ws_health = now_mono
-                        if idle_seconds >= 120:
-                            raise TimeoutError(
-                                f"Binance WebSocket received no data for {idle_seconds:.0f}s"
-                            )
-                        continue
-
-                    last_ws_packet_at = time.monotonic()
-                    ws_messages += 1
-                    packet = json.loads(raw)
-                    # Raw /ws subscriptions return the event directly.
-                    # Count acknowledgements so a connected socket is not mistaken
-                    # for a successfully subscribed market-data stream.
-                    if "id" in packet and "result" in packet:
-                        if packet.get("result") is None:
-                            subscription_acks += 1
-                            log.debug("BINANCE SUBSCRIPTION ACK | id=%s", packet.get("id"))
-                        continue
-                    if "id" in packet and ("code" in packet or "msg" in packet):
-                        subscription_rejections += 1
-                        log.error("BINANCE SUBSCRIPTION REJECTED | id=%s | code=%s | message=%s",
-                                  packet.get("id"), packet.get("code"), packet.get("msg"))
-                        continue
-                    item = packet.get("data", packet)
-                    kline = item.get("k")
-                    if not kline or not kline.get("x"):
-                        continue
-
-                    symbol = str(item.get("s", "")).upper()
-                    timeframe = kline.get("i")
-                    if symbol not in histories or timeframe not in INTERVALS:
-                        continue
-
-                    candle = {
-                        "open_time": int(kline["t"]),
-                        "open": float(kline["o"]),
-                        "high": float(kline["h"]),
-                        "low": float(kline["l"]),
-                        "close": float(kline["c"]),
-                        "volume": float(kline["v"]),
-                        "close_time": int(kline["T"]),
-                    }
-                    store_closed_candle(histories[symbol][timeframe], candle)
-                    closed_candles += 1
-
-                    now_mono = time.monotonic()
-                    if now_mono - last_ws_health >= 60:
-                        log.info(
-                            "BINANCE WS HEALTH | messages=%d | closed_candles=%d | subscription_acks=%d | rejected=%d | idle_seconds=0",
-                            ws_messages, closed_candles, subscription_acks,
-                            subscription_rejections
-                        )
-                        last_ws_health = now_mono
-
-                    if timeframe != "5m":
-                        continue
-
-                    # Keep existing PAPER challenges on their original 30-symbol
-                    # sample while production signal delivery scans the expanded top 100.
-                    if symbol in PAPER_TEST_SYMBOLS:
-                        paper_book.on_candle(symbol, candle)
-                        paper_sprint_book.on_candle(symbol, candle)
-                        paper_sprint_v3_book.on_candle(symbol, candle)
-                        orderflow_paper_book.on_candle(symbol, candle)
-
-                    # Sprint V3 uses the same unfiltered MTF signal as V2,
-                    # but its exits and 5x cap are isolated in a separate ledger.
-                    if symbol in PAPER_TEST_SYMBOLS and paper_sprint_v3_book.active():
-                        sprint_v3_signal = evaluate(symbol, histories[symbol])
-                        if sprint_v3_signal:
-                            sprint_v3_signal = dict(sprint_v3_signal)
-                            sprint_v3_signal["paper_slippage_rate"] = 0.0001
-                            sprint_v3_signal["paper_management_version"] = 3
-                            sprint_v3_signal["paper_max_gross_leverage"] = 5.0
-                            sprint_v3_opened = paper_sprint_v3_book.open_trade(sprint_v3_signal)
-                            if sprint_v3_opened:
-                                log.info(
-                                    "PAPER SPRINT V3 OPENED | %s %s | risk=0.50%% | leverage_cap=5x | breakeven=0.50R | impulse_exit=0.55R | status=%s",
-                                    sprint_v3_signal["side"], symbol, paper_sprint_v3_book.status()
-                                )
-
-                    # The sprint tests the proven baseline MTF setup independently.
-                    # The main PAPER book uses the same baseline MTF setup.
-                    if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
-                        sprint_signal = evaluate(symbol, histories[symbol])
-                        if sprint_signal:
-                            sprint_signal = dict(sprint_signal)
-                            sprint_signal["paper_slippage_rate"] = 0.0001
-                            sprint_opened = paper_sprint_book.open_trade(sprint_signal)
-                            if sprint_opened:
-                                log.info(
-                                    "PAPER SPRINT V2 OPENED | %s %s | risk=0.50%% | slippage=0.010%% | status=%s",
-                                    sprint_signal["side"], symbol, paper_sprint_book.status()
-                                )
-
-                    scan_evaluations += 1
-                    signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
-                    if signal:
-                        scan_signals += 1
-                        await dispatch_signal(signal)
-
-                    if now_mono - last_scan_report >= 300:
-                        top_rejections = scan_rejections.most_common(6)
-                        log.info(
-                            "SIGNAL SCAN HEALTH | symbols=%d | evaluations=%d | generated=%d | top_rejections=%s | intervals=%s",
-                            len(symbols), scan_evaluations, scan_signals,
-                            top_rejections, ",".join(INTERVALS)
-                        )
-                        scan_rejections.clear()
-                        scan_evaluations = 0
-                        scan_signals = 0
-                        last_scan_report = now_mono
-
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Binance signal stream disconnected; reconnecting in 10s")
-            await asyncio.sleep(10)
+        await asyncio.sleep(max(1.0, poll_interval_seconds - elapsed))
 
 
 async def main():
