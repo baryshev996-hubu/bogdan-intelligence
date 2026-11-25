@@ -14,3 +14,5 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt websockets==15.0.1 python-dotenv==1.1.1
       - run: python -m unittest discover -s tests -v
+        env:
+          PAPER_LEDGER_PATH: /tmp/bogdan-intelligence-paper-ledger.json
