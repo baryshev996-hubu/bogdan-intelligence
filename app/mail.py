@@ -5,7 +5,6 @@ and Binance Futures order-flow alerts can be delivered. No spot ticker,
 SEC, RSS, funding, OI, or generic market notifications are sent.
 """
 import asyncio
-import json
 import logging
 import os
 import time
@@ -13,7 +12,6 @@ from datetime import datetime, timezone
 from collections import Counter, deque
 
 import aiohttp
-import websockets
 from dotenv import load_dotenv
 
 from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal
@@ -621,10 +619,13 @@ async def binance_signal_monitor(session, symbols):
 
     while True:
         cycle_started = time.monotonic()
+        # Update slower context first so each 5m evaluation sees the latest
+        # fully closed 15m and 1h candles from the same polling cycle.
+        poll_order = tuple(tf for tf in ("15m", "1h", "5m") if tf in INTERVALS)
         jobs = (
             poll_symbol_timeframe(symbol, timeframe)
+            for timeframe in poll_order
             for symbol in symbols
-            for timeframe in INTERVALS
         )
         results = await asyncio.gather(*jobs)
         successful = sum(1 for ok, _ in results if ok)
