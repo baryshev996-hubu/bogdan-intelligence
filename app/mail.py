@@ -156,15 +156,15 @@ def refresh_telegram_token_from_environment() -> bool:
 
 
 async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
-    """Single-flight token validation with a hard circuit breaker for rejected credentials."""
+    """Single-flight validation with a bounded cooldown and periodic recovery."""
     global telegram_auth_valid, telegram_auth_checked_at, telegram_hard_auth_failure
 
     async with telegram_auth_lock:
         refresh_telegram_token_from_environment()
-        if telegram_auth_valid is True:
-            return True
-        if telegram_hard_auth_failure:
-            return False
+        age = time.monotonic() - telegram_auth_checked_at
+        if telegram_auth_valid is not None and age < TELEGRAM_AUTH_RECHECK_SECONDS:
+            return telegram_auth_valid is True
+        was_rejected = telegram_hard_auth_failure
         telegram_auth_checked_at = time.monotonic()
 
         if not BOT_TOKEN:
@@ -179,14 +179,15 @@ async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
                 body = await response.json(content_type=None)
                 telegram_auth_valid = response.status == 200 and body.get("ok") is True
                 if telegram_auth_valid:
+                    telegram_hard_auth_failure = False
                     bot = body.get("result") or {}
-                    log.info("TELEGRAM AUTH OK | bot_username=@%s", bot.get("username", "unknown"))
+                    log.info("TELEGRAM AUTH OK | bot_username=@%s | recovered=%s", bot.get("username", "unknown"), was_rejected)
                 elif response.status == 401:
                     telegram_hard_auth_failure = True
-                    log.critical(
-                        "TELEGRAM AUTH CIRCUIT OPEN | Telegram rejected the configured bot credential. "
-                        "All sends and automatic rechecks are stopped until the token is rotated."
-                    )
+                    if not was_rejected:
+                        log.critical("TELEGRAM AUTH CIRCUIT OPEN | Telegram rejected the configured credential; sends paused, getMe rechecked every 300s")
+                    else:
+                        log.warning("TELEGRAM AUTH STILL REJECTED | HTTP 401; sends remain paused")
                 else:
                     log.error("TELEGRAM AUTH CHECK FAILED | HTTP %s | %s",
                               response.status, body.get("description", "unknown Telegram API error"))
@@ -200,7 +201,7 @@ async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
 
 
 async def telegram_auth_monitor(session: aiohttp.ClientSession) -> None:
-    """Periodically recheck auth and recover automatically after a token rotation."""
+    """Periodically recheck auth, including rejected credentials; never retry sends while invalid."""
     while True:
         await asyncio.sleep(TELEGRAM_AUTH_RECHECK_SECONDS)
         token_changed = refresh_telegram_token_from_environment()
@@ -208,8 +209,7 @@ async def telegram_auth_monitor(session: aiohttp.ClientSession) -> None:
         if token_changed:
             log.info("TELEGRAM AUTH RECOVERY CHECK | token rotation detected")
             await validate_telegram_auth(session)
-        elif telegram_auth_valid is not True and not telegram_hard_auth_failure and stale:
-            log.info("TELEGRAM AUTH RECOVERY CHECK | retrying after transient failure")
+        elif stale:
             await validate_telegram_auth(session)
 
 
@@ -298,7 +298,7 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
             if recipient_only:
                 signal_waiting = False
             if telegram_auth_valid is not True:
-                log.warning("TELEGRAM BLOCKED | token authentication is invalid; awaiting credential rotation")
+                log.warning("TELEGRAM BLOCKED | authentication unavailable; awaiting periodic recovery check")
                 return any_delivered
             payload = {
                 "chat_id": recipient,
@@ -358,7 +358,7 @@ async def telegram_send(session: aiohttp.ClientSession, message: str, *, recipie
                             telegram_hard_auth_failure = True
                             log.critical(
                                 "TELEGRAM AUTH CIRCUIT OPEN | send endpoint rejected the configured credential. "
-                                "Queued sends are blocked and automatic retries are disabled until token rotation."
+                                "Queued sends are paused; getMe will be rechecked after the cooldown."
                             )
                             return any_delivered
 
