@@ -514,9 +514,13 @@ async def binance_signal_monitor(session, symbols):
         for symbol in symbols
         for timeframe in INTERVALS
     ]
-    # Subscribe over a raw stream connection to avoid oversized subscription frames
-    # while scanning 300 kline streams (100 symbols x 3 intervals).
-    url = "wss://fstream.binance.com/ws"
+    # Use Binance's combined-stream endpoint instead of raw /ws SUBSCRIBE.
+    # The raw endpoint acknowledged every batch but produced no market events
+    # in production. A combined stream carries market data in packet["data"].
+    # 300 streams (100 symbols x 3 intervals) remain below Binance's 1024 limit.
+    url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
+    log.info("BINANCE WS CONFIG | symbols=%d | streams=%d | url_length=%d | mode=combined",
+             len(symbols), len(streams), len(url))
 
     while True:
         try:
@@ -528,24 +532,9 @@ async def binance_signal_monitor(session, symbols):
                 open_timeout=20,
                 max_size=2**20,
             ) as websocket:
-                # Binance limits WebSocket control-message payloads. A single
-                # 300-stream SUBSCRIBE frame can be rejected as "Payload too long".
-                # Send small batches over the same connection and pace them.
-                subscription_batch_size = 40
-                for batch_index in range(0, len(streams), subscription_batch_size):
-                    batch = streams[batch_index:batch_index + subscription_batch_size]
-                    await websocket.send(json.dumps({
-                        "method": "SUBSCRIBE",
-                        "params": batch,
-                        "id": 1 + batch_index // subscription_batch_size,
-                    }, separators=(",", ":")))
-                    await asyncio.sleep(0.30)
-
                 log.info(
-                    "BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | batches=%d | batch_size=%d | intervals=%s",
-                    len(symbols), len(streams),
-                    (len(streams) + subscription_batch_size - 1) // subscription_batch_size,
-                    subscription_batch_size, ",".join(INTERVALS)
+                    "BINANCE FUTURES CONNECTED | symbols=%d | streams=%d | intervals=%s | mode=combined",
+                    len(symbols), len(streams), ",".join(INTERVALS)
                 )
 
                 ws_messages = 0
