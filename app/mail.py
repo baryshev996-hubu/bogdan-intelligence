@@ -16,7 +16,7 @@ import aiohttp
 import websockets
 from dotenv import load_dotenv
 
-from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal, confirm_signal_with_1m
+from app.signal_engine import INTERVALS, MAX_CANDLES, evaluate, format_signal, confirm_signal_with_1m_window
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
 from app.paper_trader import PaperBook, paper_book
@@ -399,20 +399,29 @@ async def binance_signal_monitor(session, symbols):
         age_ms = confirmation_candle["close_time"] - pending["signal_close_time"]
         if age_ms <= 0:
             return
-        if age_ms > 120_000:
+        if age_ms > 180_000:
             pending_signals.pop(symbol, None)
-            log.info("SIGNAL EXPIRED | %s %s | no 1m confirmation within 2 minutes",
+            log.info("SIGNAL EXPIRED | %s %s | no two 1m candles within 3 minutes",
                      pending["signal"]["side"], symbol)
+            return
+
+        if confirmation_candle["close_time"] <= pending.get("last_confirmation_time", 0):
+            return
+        pending["confirmation_candles"].append(confirmation_candle)
+        pending["last_confirmation_time"] = confirmation_candle["close_time"]
+        if len(pending["confirmation_candles"]) < 2:
             return
 
         pending_signals.pop(symbol, None)
-        confirmed = confirm_signal_with_1m(pending["signal"], confirmation_candle)
+        confirmed = confirm_signal_with_1m_window(
+            pending["signal"], pending["confirmation_candles"][:2]
+        )
         if not confirmed:
-            log.info("SIGNAL SKIPPED | %s %s | next 1m candle did not confirm entry",
+            log.info("SIGNAL SKIPPED | %s %s | two 1m candles confirmed a countertrend reversal",
                      pending["signal"]["side"], symbol)
             return
 
-        log.info("SIGNAL 1m CONFIRMED | %s %s | entry=%.6f | 1m close=%s",
+        log.info("SIGNAL 2x1m CONFIRMED | %s %s | entry=%.6f | last close=%s",
                  confirmed["side"], symbol, confirmed["entry"],
                  confirmation_candle["close_time"])
         await dispatch_confirmed_signal(confirmed)
@@ -511,7 +520,7 @@ async def binance_signal_monitor(session, symbols):
                     existing = pending_signals.get(symbol)
                     if existing:
                         age_ms = candle["close_time"] - existing["signal_close_time"]
-                        if age_ms > 120_000:
+                        if age_ms > 180_000:
                             pending_signals.pop(symbol, None)
                             log.info("SIGNAL EXPIRED | %s %s | replacing stale pending signal",
                                      existing["signal"]["side"], symbol)
@@ -521,15 +530,20 @@ async def binance_signal_monitor(session, symbols):
                     pending_signals[symbol] = {
                         "signal": signal,
                         "signal_close_time": candle["close_time"],
+                        "confirmation_candles": [],
+                        "last_confirmation_time": 0,
                     }
                     log.info("SIGNAL PENDING 1m CONFIRM | %s %s | reference_entry=%.6f",
                              signal["side"], symbol, signal["entry"])
 
-                    # Handle websocket ordering where the next 1m close arrived
+                    # Handle websocket ordering where the next 1m closes arrived
                     # before the corresponding 5m close event.
-                    latest_1m = histories[symbol]["1m"][-1] if histories[symbol]["1m"] else None
-                    if latest_1m and latest_1m["close_time"] > candle["close_time"]:
-                        await confirm_pending_signal(symbol, latest_1m)
+                    for recent_1m in list(histories[symbol]["1m"]):
+                        if (candle["close_time"] < recent_1m["close_time"]
+                                <= candle["close_time"] + 180_000):
+                            await confirm_pending_signal(symbol, recent_1m)
+                            if symbol not in pending_signals:
+                                break
 
         except asyncio.CancelledError:
             raise
