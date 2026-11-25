@@ -73,9 +73,9 @@ async def fetch_candles(session, symbol, interval):
 
 
 def simulate_trade(signal, future_candles):
-    """Partial exits: 50% at 1R, 30% at 2R, 20% at 3R.
-    After TP1 stop moves to entry; after TP2 it moves to TP1.
-    If stop and target are inside the same candle, stop is assumed first.
+    """Mirror the live paper exit plan: 70% at 0.8R, 20% at 1.5R,
+    then trail the final 10%; 2.2R is an optional full runner exit.
+    Conservative same-candle ordering assumes the active stop fills first.
     """
     if not future_candles:
         return None, None
@@ -92,52 +92,44 @@ def simulate_trade(signal, future_candles):
     realized_r = 0.0
     active_stop = initial_stop
     tp1_hit = tp2_hit = False
+    trail_buffer = 0.15 * risk
+    lock_profit = 0.10 * risk
 
     for index, candle in enumerate(future_candles[:HORIZON_BARS]):
-        if side == "LONG":
-            if candle["low"] <= active_stop:
-                realized_r += remaining * ((active_stop - entry) / risk)
-                return realized_r, index
-            if not tp1_hit and candle["high"] >= t1:
-                realized_r += 0.5
-                remaining -= 0.5
-                tp1_hit = True
-                active_stop = entry
-                if candle["low"] <= active_stop:
-                    return realized_r, index
-            if tp1_hit and not tp2_hit and candle["high"] >= t2:
-                realized_r += 0.3 * 2
-                remaining -= 0.3
-                tp2_hit = True
-                active_stop = t1
-                if candle["low"] <= active_stop:
-                    realized_r += remaining * 1.0
-                    return realized_r, index
-            if tp2_hit and candle["high"] >= t3:
-                realized_r += remaining * 3.0
-                return realized_r, index
-        else:
-            if candle["high"] >= active_stop:
-                realized_r += remaining * ((entry - active_stop) / risk)
-                return realized_r, index
-            if not tp1_hit and candle["low"] <= t1:
-                realized_r += 0.5
-                remaining -= 0.5
-                tp1_hit = True
-                active_stop = entry
-                if candle["high"] >= active_stop:
-                    return realized_r, index
-            if tp1_hit and not tp2_hit and candle["low"] <= t2:
-                realized_r += 0.3 * 2
-                remaining -= 0.3
-                tp2_hit = True
-                active_stop = t1
-                if candle["high"] >= active_stop:
-                    realized_r += remaining * 1.0
-                    return realized_r, index
-            if tp2_hit and candle["low"] <= t3:
-                realized_r += remaining * 3.0
-                return realized_r, index
+        stop_hit = (candle["low"] <= active_stop if side == "LONG"
+                    else candle["high"] >= active_stop)
+        if stop_hit:
+            direction = 1.0 if side == "LONG" else -1.0
+            realized_r += remaining * direction * (active_stop - entry) / risk
+            return realized_r, index
+
+        target1_hit = candle["high"] >= t1 if side == "LONG" else candle["low"] <= t1
+        target2_hit = candle["high"] >= t2 if side == "LONG" else candle["low"] <= t2
+        target3_hit = candle["high"] >= t3 if side == "LONG" else candle["low"] <= t3
+
+        if not tp1_hit and target1_hit:
+            realized_r += 0.70 * 0.80
+            remaining -= 0.70
+            tp1_hit = True
+            active_stop = entry + lock_profit if side == "LONG" else entry - lock_profit
+
+        if tp1_hit and not tp2_hit and target2_hit:
+            realized_r += 0.20 * 1.50
+            remaining -= 0.20
+            tp2_hit = True
+            active_stop = t1
+
+        if tp2_hit and target3_hit:
+            realized_r += remaining * 2.20
+            return realized_r, index
+
+        # Trail behind the latest completed candle, with the update taking
+        # effect from the next candle. Never loosen the protected stop.
+        if tp2_hit and remaining > 0:
+            if side == "LONG":
+                active_stop = max(active_stop, candle["low"] - trail_buffer)
+            else:
+                active_stop = min(active_stop, candle["high"] + trail_buffer)
 
     last_price = future_candles[min(len(future_candles), HORIZON_BARS) - 1]["close"]
     direction = 1.0 if side == "LONG" else -1.0
