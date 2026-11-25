@@ -23,7 +23,7 @@ from app.paper_trader import PaperBook, paper_book
 from app.upcoming_listings import run_upcoming_listings_monitor
 
 # Isolated 10-hour sprint v2. Uses the baseline MTF setup without the
-# underperforming 1m reversal veto. Separate ledger; no effect on main PAPER.
+# baseline multi-timeframe setup. Separate ledger; no effect on main PAPER.
 SPRINT_STARTED_AT = int(time.time())
 SPRINT_ENDS_AT = SPRINT_STARTED_AT + 10 * 60 * 60
 paper_sprint_book = PaperBook(
@@ -599,7 +599,7 @@ async def binance_signal_monitor(session, symbols):
                                 )
 
                     # The sprint tests the proven baseline MTF setup independently.
-                    # The main PAPER book also uses the baseline MTF setup without the 1m reversal veto.
+                    # The main PAPER book uses the same baseline MTF setup.
                     if symbol in PAPER_TEST_SYMBOLS and paper_sprint_book.active():
                         sprint_signal = evaluate(symbol, histories[symbol])
                         if sprint_signal:
