@@ -144,7 +144,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
     one = data.get("1m", [])
     if min(len(five), len(fifteen), len(hourly)) < 100 or (apply_reversal_filter and len(one) < 100):
         log.warning("%s: insufficient historical candles, skipping", symbol)
-        return {"trades": [], "candidate_signals": 0, "blocked_signals": 0}
+        return {"trades": [], "candidate_signals": 0, "blocked_signals": 0, "filter_reasons": {}}
 
     close1 = [c["close_time"] for c in one]
     close15 = [c["close_time"] for c in fifteen]
@@ -152,6 +152,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
     results = []
     candidate_signals = 0
     blocked_signals = 0
+    filter_reasons = defaultdict(int)
     last_signal = None
     index = 59
 
@@ -178,7 +179,8 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
 
         candidate_signals += 1
         if apply_reversal_filter:
-            blocked, _reason = _reversal_conflict(one_window, signal["side"])
+            blocked, reason = _reversal_conflict(one_window, signal["side"])
+            filter_reasons[reason] += 1
             if blocked:
                 blocked_signals += 1
                 index += 1
@@ -214,6 +216,7 @@ def backtest_symbol(symbol, data, apply_reversal_filter=True):
         "trades": results,
         "candidate_signals": candidate_signals,
         "blocked_signals": blocked_signals,
+        "filter_reasons": dict(filter_reasons),
     }
 
 
@@ -221,8 +224,14 @@ def report(all_results, label="FILTERED"):
     trades = [trade for result in all_results.values() for trade in result["trades"]]
     candidates = sum(result["candidate_signals"] for result in all_results.values())
     blocked = sum(result["blocked_signals"] for result in all_results.values())
+    reason_counts = defaultdict(int)
+    for result in all_results.values():
+        for reason, count in result.get("filter_reasons", {}).items():
+            reason_counts[reason] += count
     log.info("BACKTEST FILTER COUNTS | %s | candidates=%d blocked=%d passed=%d",
              label, candidates, blocked, candidates - blocked)
+    for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0])):
+        log.info("BACKTEST 1m FILTER REASON | %s | count=%d", reason, count)
     if not trades:
         log.info("BACKTEST %s: no qualifying trades in the loaded sample.", label)
         return
