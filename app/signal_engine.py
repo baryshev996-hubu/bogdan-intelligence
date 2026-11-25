@@ -61,7 +61,6 @@ def macd_histogram(values):
     slow = ema(values, 26)
     if fast is None or slow is None:
         return None
-    # Calculate a short MACD series to obtain its signal line.
     alpha_fast, alpha_slow = 2 / 13, 2 / 27
     ef = sum(values[:12]) / 12
     es = sum(values[:26]) / 26
@@ -135,7 +134,6 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
     if ema20_5 is None or abs(price - ema20_5) > 1.25 * atr5:
         return None
 
-    # Require the closed 5m candle to agree with the higher-timeframe trend.
     body = last["close"] - last["open"]
     candle_range = max(last["high"] - last["low"], price * 1e-9)
     body_ratio = abs(body) / candle_range
@@ -157,7 +155,6 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
             return None
         side = "SHORT"
 
-    # ATR stop, widened slightly only when recent structure requires it.
     recent = c5[-12:-1]
     if side == "LONG":
         structural = min(c["low"] for c in recent) - 0.10 * atr5
@@ -171,8 +168,10 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
     if risk <= 0 or risk > 2.5 * atr5:
         return None
 
-    targets = ([price + risk * n for n in (1, 2, 3)] if side == "LONG"
-               else [price - risk * n for n in (1, 2, 3)])
+    # Bring the first cash-out closer and avoid relying on a distant 3R target.
+    target_r = (0.80, 1.50, 2.20)
+    targets = ([price + risk * n for n in target_r] if side == "LONG"
+               else [price - risk * n for n in target_r])
     confidence = 65
     confidence += 5 if volume_ratio >= 1.5 else 0
     confidence += 5 if body_ratio >= 0.7 else 0
@@ -202,6 +201,7 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None):
         "entry": price,
         "stop": stop,
         "targets": targets,
+        "target_r": list(target_r),
         "confidence": confidence,
         "risk_pct": risk / price * 100,
         "entry_zone": [price - 0.15 * atr5, price + 0.15 * atr5],
@@ -222,9 +222,9 @@ def format_signal(signal):
         f"Вход: {_fmt_price(signal['entry'])}",
         f"Рабочая зона: {_fmt_price(signal['entry_zone'][0])} – {_fmt_price(signal['entry_zone'][1])}",
         f"Stop Loss: {_fmt_price(signal['stop'])}",
-        f"Take Profit 1: {_fmt_price(targets[0])}  (1R)",
-        f"Take Profit 2: {_fmt_price(targets[1])}  (2R)",
-        f"Take Profit 3: {_fmt_price(targets[2])}  (3R)",
+        f"Take Profit 1: {_fmt_price(targets[0])}  (0.8R, закрыть 70%)",
+        f"Take Profit 2: {_fmt_price(targets[1])}  (1.5R, закрыть 20%)",
+        f"Take Profit 3: {_fmt_price(targets[2])}  (2.2R, остаток 10% / trailing)",
         "",
         f"Оценка условий: {signal['confidence']}/100",
         f"Риск до стопа: {signal['risk_pct']:.2f}%",
