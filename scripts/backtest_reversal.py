@@ -315,8 +315,13 @@ async def main():
     parser.add_argument("--output", default="reversal_backtest.json")
     args = parser.parse_args()
     symbols = DEFAULT_SYMBOLS if args.symbols == 30 else DEFAULT_SYMBOLS
-    end_ms = int(time.time() * 1000)
+    # Use only complete UTC days so the requested history is fully available
+    # from Binance public daily/monthly archives.
+    now = datetime.now(timezone.utc)
+    end_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_ms = int(end_dt.timestamp() * 1000)
     start_ms = end_ms - args.days * 86_400_000
+    expected_candles = args.days * 288
     semaphore = asyncio.Semaphore(5)
     connector = aiohttp.TCPConnector(limit=10)
     timeout = aiohttp.ClientTimeout(total=45)
@@ -332,8 +337,17 @@ async def main():
         if isinstance(data, Exception):
             failures[symbol] = str(data)
             continue
-        if len(data) < 500:
-            failures[symbol] = f"insufficient candles: {len(data)}"
+        if len(data) < expected_candles * 0.99:
+            failures[symbol] = (
+                f"incomplete history: {len(data)}/{expected_candles} candles "
+                f"({len(data) / expected_candles:.1%})"
+            )
+            continue
+        if data[0]["open_time"] > start_ms + INTERVAL_MS or data[-1]["open_time"] < end_ms - 2 * INTERVAL_MS:
+            failures[symbol] = (
+                f"date coverage gap: first={datetime.fromtimestamp(data[0]['open_time']/1000, timezone.utc).isoformat()}, "
+                f"last={datetime.fromtimestamp(data[-1]['open_time']/1000, timezone.utc).isoformat()}"
+            )
             continue
         result, blocked = evaluate_symbol(symbol, data)
         for mode in all_rows:
@@ -345,7 +359,11 @@ async def main():
         all_rows[mode].sort(key=lambda row: row["signal_time"])
 
     report = {
-        "period_days": args.days, "symbols_requested": len(symbols),
+        "period_days": args.days,
+        "period_start_utc": datetime.fromtimestamp(start_ms / 1000, timezone.utc).isoformat(),
+        "period_end_utc": datetime.fromtimestamp(end_ms / 1000, timezone.utc).isoformat(),
+        "expected_5m_candles_per_symbol": expected_candles,
+        "symbols_requested": len(symbols),
         "symbols_tested": len(symbols) - len(failures),
         "failures": failures, "blocked_by_reversal_reasons": dict(rejected),
         "baseline": metrics(all_rows["baseline"]),
