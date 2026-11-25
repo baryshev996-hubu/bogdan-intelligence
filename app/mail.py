@@ -68,15 +68,35 @@ last_signal_sent = {}
 telegram_send_lock = asyncio.Lock()
 telegram_last_sent = 0.0
 telegram_auth_valid = None
+telegram_auth_checked_at = 0.0
+TELEGRAM_AUTH_RECHECK_SECONDS = 300
+
+
+def refresh_telegram_token_from_environment() -> bool:
+    """Pick up a rotated Railway variable after a process restart/reconfiguration."""
+    global BOT_TOKEN, telegram_auth_valid, telegram_auth_checked_at
+    candidate = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if candidate and candidate != BOT_TOKEN:
+        BOT_TOKEN = candidate
+        telegram_auth_valid = None
+        telegram_auth_checked_at = 0.0
+        log.warning("TELEGRAM TOKEN CHANGED | revalidating without logging the token")
+        return True
+    return False
+
 
 
 async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
-    """Validate the configured bot token once at startup without exposing it."""
-    global telegram_auth_valid
+    """Validate token and remember the result. Never log the secret."""
+    global telegram_auth_valid, telegram_auth_checked_at
+    refresh_telegram_token_from_environment()
+    telegram_auth_checked_at = time.monotonic()
+
     if not BOT_TOKEN:
         telegram_auth_valid = False
-        log.error("TELEGRAM AUTH CHECK FAILED | TELEGRAM_BOT_TOKEN is empty")
+        log.critical("TELEGRAM AUTH FAILED | TELEGRAM_BOT_TOKEN is empty")
         return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
     try:
         async with session.get(url, timeout=15) as response:
@@ -85,14 +105,35 @@ async def validate_telegram_auth(session: aiohttp.ClientSession) -> bool:
             if telegram_auth_valid:
                 bot = body.get("result") or {}
                 log.info("TELEGRAM AUTH OK | bot_username=@%s", bot.get("username", "unknown"))
+            elif response.status == 401:
+                log.critical(
+                    "TELEGRAM AUTH INVALID (401) | token is rejected by Telegram. "
+                    "Automatic token regeneration is impossible. Replace TELEGRAM_BOT_TOKEN "
+                    "in Railway with a fresh BotFather token; the service will revalidate on restart."
+                )
             else:
                 log.error("TELEGRAM AUTH CHECK FAILED | HTTP %s | %s",
                           response.status, body.get("description", "unknown Telegram API error"))
             return telegram_auth_valid
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
-        telegram_auth_valid = None
-        log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s", type(exc).__name__, str(exc)[:180])
+        telegram_auth_valid = False
+        log.error("TELEGRAM AUTH CHECK INCONCLUSIVE | %s: %s",
+                  type(exc).__name__, str(exc)[:180])
         return False
+
+
+async def telegram_auth_monitor(session: aiohttp.ClientSession) -> None:
+    """Periodically recheck auth and recover automatically after a token rotation."""
+    while True:
+        await asyncio.sleep(TELEGRAM_AUTH_RECHECK_SECONDS)
+        token_changed = refresh_telegram_token_from_environment()
+        stale = time.monotonic() - telegram_auth_checked_at >= TELEGRAM_AUTH_RECHECK_SECONDS
+        if token_changed or (telegram_auth_valid is not True and stale):
+            log.info("TELEGRAM AUTH RECOVERY CHECK | checking configured token")
+            await validate_telegram_auth(session)
+
 
 
 def is_allowed_telegram_alert(message: str) -> bool:
@@ -135,12 +176,18 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
         log.info("TELEGRAM BLOCKED | header=%r", first_line[:120])
         return False
 
+    refresh_telegram_token_from_environment()
     if not BOT_TOKEN or not CHAT_ID:
         log.error("Telegram is not configured. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
         return False
-    if telegram_auth_valid is False:
-        log.error("TELEGRAM BLOCKED | startup token validation failed; update TELEGRAM_BOT_TOKEN in Railway")
-        return False
+    if telegram_auth_valid is not True:
+        age = time.monotonic() - telegram_auth_checked_at
+        if telegram_auth_valid is None or age >= TELEGRAM_AUTH_RECHECK_SECONDS:
+            if not await validate_telegram_auth(session):
+                return False
+        else:
+            log.warning("TELEGRAM BLOCKED | authentication unavailable; waiting for next recovery check")
+            return False
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -180,6 +227,17 @@ async def telegram_send(session: aiohttp.ClientSession, message: str) -> bool:
                         log.warning("Telegram HTTP %s; retrying in %ss", response.status, backoff)
                         await asyncio.sleep(backoff)
                         continue
+
+                    if response.status == 401:
+                        global telegram_auth_valid, telegram_auth_checked_at
+                        telegram_auth_valid = False
+                        telegram_auth_checked_at = time.monotonic()
+                        log.critical(
+                            "TELEGRAM SEND AUTH FAILED (401) | token rejected. "
+                            "Stopped all further sends to prevent retry storms. "
+                            "A fresh BotFather token must be saved as TELEGRAM_BOT_TOKEN in Railway."
+                        )
+                        return False
 
                     log.error("Telegram rejected message: HTTP %s, response=%s", response.status, body)
                     return False
@@ -499,7 +557,10 @@ async def main():
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         await validate_telegram_auth(session)
         universe = await discover_trading_universe(session)
-        tasks = [binance_signal_monitor(session, universe)]
+        tasks = [
+            binance_signal_monitor(session, universe),
+            telegram_auth_monitor(session),
+        ]
 
         if ENABLE_MARKET_INTEL:
             # Public Hyperliquid executions and Binance order-book flow.
