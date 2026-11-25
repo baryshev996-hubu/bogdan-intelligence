@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from statistics import mean
 
 
-INTERVALS = ("1m", "5m", "15m", "1h")
+INTERVALS = ("5m", "15m", "1h")
 MAX_CANDLES = 240
 
 
@@ -93,60 +93,6 @@ def _trend(candles):
 
 
 
-def _reversal_conflict(candles, side):
-    """Detect sustained counter-trend 1m pressure without reacting to one weak candle."""
-    if len(candles) < 30:
-        return True, "недостаточно 1m истории"
-
-    closes = [c["close"] for c in candles]
-    last = candles[-1]
-    e5, e13 = ema(closes, 5), ema(closes, 13)
-    prev_e5, prev_e13 = ema(closes[:-1], 5), ema(closes[:-1], 13)
-    if None in (e5, e13, prev_e5, prev_e13):
-        return True, "недостаточно 1m индикаторов"
-
-    recent_closes = closes[-5:]
-    rising_steps = sum(recent_closes[i] > recent_closes[i - 1] for i in range(1, 5))
-    falling_steps = sum(recent_closes[i] < recent_closes[i - 1] for i in range(1, 5))
-    current_rsi = rsi(closes, 14)
-
-    avg_volume = mean(c["volume"] for c in candles[-21:-1])
-    candle_range = max(last["high"] - last["low"], last["close"] * 1e-9)
-    body_ratio = abs(last["close"] - last["open"]) / candle_range
-    volume_impulse = avg_volume > 0 and last["volume"] >= 1.15 * avg_volume and body_ratio >= 0.55
-    prior = candles[-4:-1]
-
-    if side == "SHORT":
-        ema_pressure = last["close"] > e5 and e5 > e13 and prev_e5 > prev_e13
-        momentum = rising_steps >= 3 and current_rsi is not None and current_rsi > 50
-        structure_break = last["close"] > max(c["high"] for c in prior)
-        impulse = last["close"] > last["open"] and volume_impulse
-        confirmed = ema_pressure or impulse or (momentum and structure_break)
-        active = [name for name, flag in (
-            ("fast EMA 1m вверх", ema_pressure),
-            ("восходящий импульс 1m", momentum),
-            ("пробит локальный максимум", structure_break),
-            ("бычья свеча с объёмом", impulse),
-        ) if flag]
-        reason = "восходящий разворот 1m: " + ", ".join(active)
-    else:
-        ema_pressure = last["close"] < e5 and e5 < e13 and prev_e5 < prev_e13
-        momentum = falling_steps >= 3 and current_rsi is not None and current_rsi < 50
-        structure_break = last["close"] < min(c["low"] for c in prior)
-        impulse = last["close"] < last["open"] and volume_impulse
-        confirmed = ema_pressure or (momentum and (structure_break or impulse)) or (structure_break and impulse)
-        active = [name for name, flag in (
-            ("fast EMA 1m вниз", ema_pressure),
-            ("нисходящий импульс 1m", momentum),
-            ("пробит локальный минимум", structure_break),
-            ("медвежья свеча с объёмом", impulse),
-        ) if flag]
-        reason = "нисходящий разворот 1m: " + ", ".join(active)
-
-    return confirmed, reason if active else "1m: ни один встречный признак не сработал"
-
-
-
 def _fmt_price(value):
     if value >= 1000:
         return f"{value:,.2f}"
@@ -155,20 +101,15 @@ def _fmt_price(value):
     return f"{value:.6f}"
 
 
-def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=False):
+def evaluate(symbol, candles_by_interval, as_of_ms=None):
     """Return a signal dict only when strict conditions align."""
     candles = {tf: list(candles_by_interval.get(tf, ())) for tf in INTERVALS}
     required = ("5m", "15m", "1h")
     if any(len(candles[tf]) < 60 for tf in required):
         return None
-    if apply_reversal_filter and len(candles["1m"]) < 24:
-        return None
-
-    c1, c5, c15, c1h = candles["1m"], candles["5m"], candles["15m"], candles["1h"]
+    c5, c15, c1h = candles["5m"], candles["15m"], candles["1h"]
     now_ms = as_of_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     freshness_limits = {"5m": 12 * 60 * 1000, "15m": 35 * 60 * 1000, "1h": 2 * 60 * 60 * 1000}
-    if apply_reversal_filter:
-        freshness_limits["1m"] = 3 * 60 * 1000
     for timeframe, limit_ms in freshness_limits.items():
         latest = candles[timeframe][-1].get("close_time", 0)
         if not latest or now_ms - latest > limit_ms:
@@ -215,11 +156,6 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=F
             return None
         side = "SHORT"
 
-    if apply_reversal_filter:
-        reversal, reversal_reason = _reversal_conflict(c1, side)
-        if reversal:
-            return None
-
     recent = c5[-12:-1]
     if side == "LONG":
         structural = min(c["low"] for c in recent) - 0.10 * atr5
@@ -260,8 +196,6 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=F
         f"MACD histogram: {'+' if hist > 0 else '-'}",
         "Закрытая 5m свеча подтвердила направление",
     ]
-    if apply_reversal_filter:
-        reasons.append("1m фильтр: встречный разворот не подтверждён")
     return {
         "symbol": symbol,
         "side": side,
@@ -277,89 +211,6 @@ def evaluate(symbol, candles_by_interval, as_of_ms=None, apply_reversal_filter=F
         "candle_id": last.get("open_time"),
     }
 
-
-
-def confirm_signal_with_1m(signal, candle):
-    """Veto a 1m candle that closes against the proposed entry, then reprice."""
-    entry = float(signal["entry"])
-    open_price = float(candle["open"])
-    close_price = float(candle["close"])
-    risk = abs(entry - float(signal["stop"]))
-    if risk <= 0:
-        return None
-
-    delta = close_price - entry
-
-    if signal["side"] == "SHORT":
-        if close_price > open_price and close_price > entry:
-            return None
-        direction_text = "1m close did not break upward through the SHORT entry"
-    else:
-        if close_price < open_price and close_price < entry:
-            return None
-        direction_text = "1m close did not break downward through the LONG entry"
-
-    adjusted = dict(signal)
-    adjusted["entry"] = close_price
-    adjusted["stop"] = float(signal["stop"]) + delta
-    adjusted["targets"] = [float(target) + delta for target in signal["targets"]]
-    adjusted["entry_zone"] = [float(level) + delta for level in signal["entry_zone"]]
-    adjusted["risk_pct"] = abs(adjusted["entry"] - adjusted["stop"]) / adjusted["entry"] * 100
-    adjusted["candle_time"] = datetime.fromtimestamp(
-        int(candle["close_time"]) / 1000, timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-    adjusted["reasons"] = list(signal.get("reasons", [])) + [direction_text]
-    return adjusted
-
-
-
-
-def confirm_signal_with_1m_window(signal, candles):
-    """Confirm or veto a setup using two consecutive closed 1m candles."""
-    if len(candles) < 2:
-        return None
-    first, last = candles[0], candles[1]
-    if int(last["close_time"]) <= int(first["close_time"]):
-        return None
-    if int(last["close_time"]) - int(first["close_time"]) > 120_000:
-        return None
-
-    entry = float(signal["entry"])
-    first_open = float(first["open"])
-    last_close = float(last["close"])
-    delta = last_close - entry
-
-    if signal["side"] == "SHORT":
-        reversal = (
-            all(float(c["close"]) > float(c["open"]) for c in candles[:2])
-            and last_close > entry
-            and last_close > first_open
-        )
-        if reversal:
-            return None
-        direction_text = "two 1m closes did not confirm an upward reversal through SHORT entry"
-    else:
-        reversal = (
-            all(float(c["close"]) < float(c["open"]) for c in candles[:2])
-            and last_close < entry
-            and last_close < first_open
-        )
-        if reversal:
-            return None
-        direction_text = "two 1m closes did not confirm a downward reversal through LONG entry"
-
-    adjusted = dict(signal)
-    adjusted["entry"] = last_close
-    adjusted["stop"] = float(signal["stop"]) + delta
-    adjusted["targets"] = [float(target) + delta for target in signal["targets"]]
-    adjusted["entry_zone"] = [float(level) + delta for level in signal["entry_zone"]]
-    adjusted["risk_pct"] = abs(adjusted["entry"] - adjusted["stop"]) / adjusted["entry"] * 100
-    adjusted["entry_time"] = int(last["close_time"])
-    adjusted["candle_time"] = datetime.fromtimestamp(
-        int(last["close_time"]) / 1000, timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
-    adjusted["reasons"] = list(signal.get("reasons", [])) + [direction_text]
-    return adjusted
 
 
 def format_signal(signal):
