@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import signal_delivery
-from app.leverage import build_leverage_paper_signal
+from app.leverage import build_leverage_paper_signal, build_structural_paper_signal, recent_paper_loss
 from app.paper_trader import PaperBook
 
 
@@ -36,3 +36,38 @@ class SignalPipelineTests(unittest.TestCase):
             with sqlite3.connect(signal_delivery.PATH) as db:
                 self.assertEqual(db.execute("SELECT recipient,candle,done FROM deliveries ORDER BY candle,recipient").fetchall(),
                                  [("a",300000,1),("b",300000,0),("a",600000,0),("b",600000,0)])
+
+
+class StructuralPaperRiskTests(unittest.TestCase):
+    def test_keeps_stop_and_caps_net_loss_both_directions(self):
+        from app.analyst import net_move
+        for side, stop in (("LONG", 99.0), ("SHORT", 101.0)):
+            for score in (75, 95):
+                raw = dict(symbol="X", side=side, entry=100, stop=stop,
+                           confidence=score, candle_id=300000)
+                signal = build_structural_paper_signal(raw, 200)
+                self.assertIsNotNone(signal)
+                self.assertEqual(signal["stop"], stop)
+                self.assertEqual(signal["paper_leverage"], 10)
+                self.assertLessEqual(signal["paper_margin"], 20)
+                self.assertAlmostEqual(signal["paper_qty"] * -net_move(side, 100, stop), .5)
+                with tempfile.TemporaryDirectory() as tmp:
+                    book = PaperBook(path=str(Path(tmp)/"risk"), start_balance=200,
+                                     risk_fraction=.0025, max_gross_leverage=20)
+                    self.assertTrue(book.open_trade(signal))
+                    book.on_candle("X", dict(open_time=600000, open=100, high=102, low=98, close=100))
+                    self.assertAlmostEqual(book.state["closed_trades"][0]["net_pnl"], -.5)
+
+    def test_rejects_invalid_or_costly_stop(self):
+        self.assertIsNone(build_structural_paper_signal(dict(side="LONG", entry=100, stop=101), 200))
+        self.assertIsNone(build_structural_paper_signal(dict(side="SHORT", entry=100, stop=104), 200))
+        self.assertIsNone(build_structural_paper_signal(dict(side="LONG", entry=100, stop=99), 0))
+
+    def test_reentry_only_after_same_side_loss(self):
+        signal = dict(symbol="BONK", side="LONG")
+        trade = dict(symbol="BONK", side="LONG", net_pnl=-.5, closed_at=10000)
+        self.assertTrue(recent_paper_loss(signal, [trade], 10100))
+        self.assertFalse(recent_paper_loss(signal, [trade], 13600))
+        self.assertFalse(recent_paper_loss(dict(signal, side="SHORT"), [trade], 10100))
+        self.assertFalse(recent_paper_loss(dict(signal, symbol="BTC"), [trade], 10100))
+        self.assertFalse(recent_paper_loss(signal, [dict(trade, net_pnl=.5)], 10100))
