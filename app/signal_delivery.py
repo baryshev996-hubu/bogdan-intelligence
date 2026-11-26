@@ -35,8 +35,12 @@ async def deliver_signals(session, sender):
         while True:
             now = int(time.time())
             with db:
-                expired = db.execute("UPDATE deliveries SET done=2 WHERE done=0 AND candle+600000<=?",
-                                     (now * 1000,)).rowcount
+                # Expire after 90s from the 5m close and never deliver pre-v2 queued alerts.
+                expired = db.execute(
+                    "UPDATE deliveries SET done=2 WHERE done=0 AND "
+                    "(candle+390000<=? OR instr(message, ?) = 0)",
+                    (now * 1000, "Оценка качества условий, не вероятность прибыли")
+                ).rowcount
             if expired:
                 log.warning("SIGNAL DELIVERY EXPIRED | recipients=%d", expired)
             row = db.execute("""SELECT rowid,symbol,recipient,message FROM deliveries
