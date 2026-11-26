@@ -22,7 +22,7 @@ if __name__ == "__main__":
 from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, SIGNAL_ALERT_SUFFIX, evaluate, format_signal
 from app.analyst import market_context
 from app.signal_quality import assess_quality, VERSION as QUALITY_VERSION
-from app.leverage import build_structural_paper_signal
+from app.leverage import build_structural_paper_signal, recent_paper_loss
 from app.signal_delivery import queue_signal, deliver_signals
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
@@ -530,7 +530,10 @@ async def binance_signal_monitor(session, symbols):
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
         if leverage_paper_book.active():
-            leverage_signal = build_structural_paper_signal(signal, leverage_paper_book.state["balance"])
+            repeated_loss = recent_paper_loss(signal, leverage_paper_book.state["closed_trades"], time.time())
+            leverage_signal = None if repeated_loss else build_structural_paper_signal(signal, leverage_paper_book.state["balance"])
+            if repeated_loss:
+                log.info("PAPER LEVERAGE REENTRY BLOCKED | %s %s | recent same-side loss within 60m", signal["side"], symbol)
             if leverage_signal:
                 leverage_opened = leverage_paper_book.open_trade(leverage_signal)
                 if leverage_opened:
