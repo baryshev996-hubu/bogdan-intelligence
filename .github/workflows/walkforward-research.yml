@@ -1,0 +1,214 @@
+name: walkforward-ensemble-research
+on:
+  push:
+    branches: [research/walkforward-ensemble-20261127]
+permissions:
+  contents: read
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [rules, ml]
+    env:
+      MODE: ${{ matrix.mode }}
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy pandas scikit-learn
+      - name: Offline research with monthly holdouts
+        run: |
+          python -u - <<'PY'
+          """Offline, walk-forward research only. No Telegram, API keys or orders."""
+          import os, io, zipfile, urllib.request, urllib.parse, urllib.error, concurrent.futures as cf, time, json, math
+          import numpy as np
+          import pandas as pd
+          from sklearn.ensemble import HistGradientBoostingClassifier
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.pipeline import make_pipeline
+          from sklearn.preprocessing import StandardScaler
+          MODE=os.environ.get("MODE","ml")
+          SYMS=[x+"USDT" for x in "BTC ETH SOL XRP BNB LTC LINK DOGE ADA AVAX BCH TRX XLM DOT UNI AAVE NEAR ETC FIL ATOM HBAR ICP SUI OP ARB INJ".split()]
+          BASE="https://data.binance.vision/data/futures/um"
+          H=24
+          def acquire(s):
+              dates=[("monthly",f"2026-{m:02}") for m in range(1,11)]+[("daily",f"2026-11-{d:02}") for d in range(1,26)]
+              frames=[]
+              for kind,stamp in dates:
+                  path=f"{BASE}/{kind}/klines/{s}/5m/{s}-5m-{stamp}.zip"
+                  raw=None
+                  for trial in range(3):
+                      try:
+                          with urllib.request.urlopen(path,timeout=30) as f: raw=f.read()
+                          break
+                      except urllib.error.HTTPError as e:
+                          if e.code==404:
+                              print("MISSING",s,stamp,flush=True);break
+                          if trial==2: raise
+                          time.sleep(2**trial)
+                      except (OSError,TimeoutError):
+                          if trial==2: raise
+                          time.sleep(2**trial)
+                  if raw is None: continue
+                  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                      a=pd.read_csv(z.open(z.namelist()[0]),header=None,usecols=[0,1,2,3,4,5,9],names=["t","o","h","l","c","v","buy"])
+                  a=a.apply(pd.to_numeric,errors="coerce").dropna()
+                  a["t"]=np.where(a.t>10**14,a.t//1000,a.t).astype("int64")
+                  frames.append(a)
+              if not frames: return s,None
+              a=pd.concat(frames).drop_duplicates("t").sort_values("t").reset_index(drop=True)
+              a=a[(a.c>0)&(a.v>0)&(a.buy>=0)&(a.buy<=a.v)&(a.h>=a.l)]
+              print("DATA",s,len(a),flush=True)
+              return s,a
+          def div(a,b): return a/b.replace(0,np.nan)
+          def ema(x,n): return x.ewm(span=n,adjust=False,min_periods=n).mean()
+          def rsi(x,n=14):
+              d=x.diff();up=d.clip(lower=0).ewm(alpha=1/n,adjust=False,min_periods=n).mean();dn=(-d.clip(upper=0)).ewm(alpha=1/n,adjust=False,min_periods=n).mean()
+              return 100*up/(up+dn)-50
+          def agg(a,n):
+              b=a.copy();b["bucket"]=b.t//(n*300000)
+              b=b.groupby("bucket",sort=True).agg(t=("t","first"),last=("t","last"),o=("o","first"),h=("h","max"),l=("l","min"),c=("c","last"),v=("v","sum"),buy=("buy","sum"),n=("t","size")).reset_index(drop=True)
+              b=b[(b.n==n)&(b["last"]-b.t==(n-1)*300000)].copy()
+              b["time"]=b["last"]+300000
+              return b
+          def feat(a,tag):
+              c=a.c; o=a.o; h=a.h; l=a.l; v=a.v
+              tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+              atr=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+              e20=ema(c,20); e50=ema(c,50); macd=ema(c,12)-ema(c,26); mh=macd-ema(macd,9)
+              width=h-l
+              f=pd.DataFrame({"time":a["time"],"atr":div(atr,c),"rsi":rsi(c),"trend":div(e20-e50,atr),"slope":div(e20-e20.shift(3),atr),"dist":div(c-e20,atr),"macd":div(mh,atr),"macd_delta":div(mh-mh.shift(),atr),"ret1":c.pct_change(),"ret3":c.pct_change(3),"ret12":c.pct_change(12),"volatility":c.pct_change().rolling(20).std(),"relvol":div(v,v.shift().rolling(20).mean()),"body":div(c-o,width),"pos":div(c-l,width)-.5,"flow":div(a.buy,v)-.5,"flow3":div(a.buy.rolling(3).sum(),v.rolling(3).sum())-.5,"upbreak":div(c-h.shift().rolling(20).max(),atr),"downbreak":div(l.shift().rolling(20).min()-c,atr),"z":div(c-c.rolling(20).mean(),c.rolling(20).std()),"efficiency":div((c-c.shift(12)).abs(),c.diff().abs().rolling(12).sum())})
+              return f.rename(columns={k:tag+"_"+k for k in f.columns if k!="time"})
+          def labels(a,indices,direction):
+              t=a.t.to_numpy();op=a.o.to_numpy();hi=a.h.to_numpy();lo=a.l.to_numpy();cl=a.c.to_numpy()
+              a5=a.copy();a5["time"]=a5.t+300000
+              atr=feat(a5,"f").f_atr.to_numpy()
+              ix=np.asarray(indices);ent=op[ix+1];risk=np.maximum(1.5*atr[ix]*cl[ix],.004*ent)
+              stop=ent-direction*risk;tp=ent+direction*1.2*risk
+              valid=(t[ix+H]-t[ix]==H*300000)&np.isfinite(risk)&(risk>0)&(stop>0)&(tp>0)
+              out=cl[ix+H].copy();exitix=ix+H;active=valid.copy()
+              for j in range(1,H+1):
+                  q=ix+j
+                  sh=active&((lo[q]<=stop) if direction==1 else (hi[q]>=stop))
+                  out[sh]=(np.minimum(stop,op[q]) if direction==1 else np.maximum(stop,op[q]))[sh];exitix[sh]=q[sh];active[sh]=False
+                  hit=active&((hi[q]>=tp) if direction==1 else (lo[q]<=tp))
+                  out[hit]=tp[hit];exitix[hit]=q[hit];active[hit]=False
+              def net(fee,slip):
+                  buy=ent*(1+direction*slip);sell=out*(1-direction*slip)
+                  return (direction*(sell-buy)-fee*(buy+sell))/risk
+              return valid,net(.0005,.0001),net(.0007,.0002),t[exitix]+300000
+          def feature_data(s,a,btc):
+              a=a.copy();a["time"]=a.t+300000
+              f=feat(a,"m5"); ix=np.flatnonzero(((a.time.to_numpy()%900000)==0)&(np.arange(len(a))>=300)&(np.arange(len(a))<len(a)-H))
+              base=f.iloc[ix].reset_index(drop=True)
+              for n,tag in [(3,"m15"),(12,"h1")]:
+                  slow=feat(agg(a,n),tag)
+                  base=pd.merge_asof(base,slow,on="time",direction="backward",tolerance=(n-1)*300000)
+              base=pd.merge_asof(base,btc,on="time",direction="backward",tolerance=0)
+              base["hour_sin"]=np.sin(2*np.pi*(base.time//3600000%24)/24)
+              base["hour_cos"]=np.cos(2*np.pi*(base.time//3600000%24)/24)
+              allrows=[]
+              for d in (1,-1):
+                  b=base.copy(); b["symbol"]=s;b["side"]=d
+                  valid,net,stress,exit_t=labels(a,ix,d)
+                  b["net"]=net;b["stress"]=stress;b["exit"]=exit_t
+                  for tag in ("m5","m15","h1","btc"):
+                      for col in ("rsi","trend","slope","dist","macd","macd_delta","ret1","ret3","ret12","body","pos","flow","flow3","z"):
+                          key=tag+"_"+col
+                          if key in b: b[key]*=d
+                      if d==-1 and tag+"_upbreak" in b:
+                          x=b[tag+"_upbreak"].copy();b[tag+"_upbreak"]=b[tag+"_downbreak"];b[tag+"_downbreak"]=x
+                  b["trend_gate"]=(b.h1_trend>0)&(b.m15_trend>0)&(b.m5_macd>0)&(b.m5_flow>0)&(b.m5_dist.abs()<2)
+                  b["breakout_gate"]=(b.m15_upbreak>=-.25)&(b.h1_trend>-.25)&(b.m5_relvol>=1.2)&(b.m5_flow>0)&(b.m5_body>0)
+                  b["reversal_gate"]=(b.m15_z<-.7)&(b.m5_macd_delta>0)&(b.m5_flow>0)&(b.m5_body>0)&(b.h1_trend> -1.5)
+                  b=b.loc[valid].replace([np.inf,-np.inf],np.nan).dropna()
+                  allrows.append(b)
+              return pd.concat(allrows,ignore_index=True)
+          with cf.ThreadPoolExecutor(max_workers=10) as ex: raw=dict(ex.map(acquire,SYMS))
+          raw={s:a for s,a in raw.items() if a is not None and len(a)>1000}
+          btc=raw["BTCUSDT"].copy();btc["time"]=btc.t+300000
+          btc=feat(btc,"btc")[["time","btc_ret1","btc_ret3","btc_ret12","btc_trend","btc_flow","btc_volatility"]]
+          parts=[]
+          for s,a in raw.items():
+              b=feature_data(s,a,btc);parts.append(b);print("FEATURES",s,len(b),flush=True)
+          D=pd.concat(parts,ignore_index=True).sort_values(["time","symbol","side"]).reset_index(drop=True)
+          D["month"]=pd.to_datetime(D.time,unit="ms",utc=True).dt.strftime("%Y-%m")
+          FEATURES=[c for c in D if c not in ("time","symbol","side","net","stress","exit","month","trend_gate","breakout_gate","reversal_gate")]
+          GATES=["trend_gate","breakout_gate","reversal_gate"]
+          def evaluate(b,score,threshold,gate=None):
+              mask=np.isfinite(score)&(score>=threshold)
+              if gate is not None: mask&=b[gate].to_numpy()
+              c=b.loc[mask,["time","symbol","side","net","stress","exit"]].copy();c["score"]=score[mask]
+              c=c.sort_values(["time","score"],ascending=[True,False]).drop_duplicates(["symbol","time"])
+              end={};rows=[]
+              for row in c.itertuples(index=False):
+                  if row.time<end.get(row.symbol,0):continue
+                  end[row.symbol]=row.exit;rows.append((row.exit,row.net,row.stress))
+              if not rows:return dict(n=0,wins=0,net_R=0.,stress_R=0.,pf=None,dd_R=0.,winrate=None,lower95=None)
+              arr=np.array(sorted(rows));v=arr[:,1];eq=np.r_[0.,np.cumsum(v)];n=len(v);w=int((v>0).sum());p=w/n;z=1.96
+              lower=(p+z*z/(2*n)-z*np.sqrt(p*(1-p)/n+z*z/(4*n*n)))/(1+z*z/n)
+              loss=-v[v<0].sum()
+              return dict(n=n,wins=w,net_R=float(v.sum()),stress_R=float(arr[:,2].sum()),pf=float(v[v>0].sum()/loss) if loss>0 else None,dd_R=float(np.max(np.maximum.accumulate(eq)-eq)),winrate=float(p),lower95=float(lower))
+          def fold(month):
+              ts=int(pd.Timestamp(month+"-01",tz="UTC").timestamp()*1000)
+              prev=(pd.Timestamp(month+"-01")-pd.offsets.MonthBegin(1)).strftime("%Y-%m")
+              valstart=int(pd.Timestamp(prev+"-01",tz="UTC").timestamp()*1000)
+              end=int((pd.Timestamp(month+"-01",tz="UTC")+pd.offsets.MonthBegin(1)).timestamp()*1000)
+              train=D[(D.time<valstart)&(D.exit<valstart)]
+              val=D[(D.time>=valstart)&(D.time<ts)&(D.exit<ts)]
+              test=D[(D.time>=ts)&(D.time<end)&(D.exit<end)]
+              return train,val,test
+          def emit(month,name,threshold,metrics,phase="test"):
+              print("RESULT",json.dumps(dict(month=month,model=name,threshold=threshold,phase=phase,**metrics),allow_nan=False),flush=True)
+          def rules(b):
+              return {"trend":(b.m5_relvol>=1.10)&(b.m5_body>.35)&(b.m5_rsi>0)&(b.m5_rsi<20)&b.trend_gate,
+                      "breakout":b.breakout_gate&(b.m5_pos>.2)&(b.m15_flow3>0),
+                      "reversal":b.reversal_gate&(b.m5_pos>.2)&(b.m5_rsi<0),
+                      "confluence":b.trend_gate&(b.m5_relvol>=1.05)&(b.m15_flow3>0)&(b.btc_ret12>-.002)&(b.m5_macd_delta>0)}
+          def models(train,val,test):
+              y=(train.net>0).astype(int)
+              result={}
+              for name,gate in [("pooled",None),("trend_expert","trend_gate"),("breakout_expert","breakout_gate"),("reversal_expert","reversal_gate")]:
+                  subset=train if gate is None else train[train[gate]]
+                  if len(subset)<2000 or (subset.net>0).nunique()<2: continue
+                  model=HistGradientBoostingClassifier(max_iter=80,max_leaf_nodes=15,min_samples_leaf=100,l2_regularization=3,early_stopping=False,random_state=42)
+                  model.fit(subset[FEATURES],(subset.net>0).astype(int))
+                  result[name]=(model.predict_proba(val[FEATURES])[:,1],model.predict_proba(test[FEATURES])[:,1],gate)
+              logistic=make_pipeline(StandardScaler(),LogisticRegression(C=.1,max_iter=200))
+              logistic.fit(train[FEATURES],y)
+              lv=logistic.predict_proba(val[FEATURES])[:,1];lt=logistic.predict_proba(test[FEATURES])[:,1]
+              result["logistic"]=(lv,lt,None)
+              if "pooled" in result:
+                  v,t,_=result["pooled"];result["ensemble"]=(.7*v+.3*lv,.7*t+.3*lt,None)
+              return result
+          print("CONFIG",json.dumps(dict(mode=MODE,symbols=len(raw),rows=len(D),features=len(FEATURES),train_start="2026-01",first_test="2026-06",last_test="2026-11",fees_each_side=.0005,slip_each_side=.0001,horizon_bars=H,rr=1.2)),flush=True)
+          for month in [f"2026-{m:02}" for m in range(6,12)]:
+              train,val,test=fold(month)
+              if min(len(train),len(val),len(test))<1000: raise RuntimeError("insufficient fold "+month)
+              if MODE=="rules":
+                  for name,mask in rules(test).items():
+                      emit(month,name,.5,evaluate(test,mask.to_numpy(dtype=float),.5))
+                  continue
+              for name,(v,t,g) in models(train,val,test).items():
+                  # Fixed, predeclared thresholds reported; selection uses only preceding validation month.
+                  candidates=[]
+                  for threshold in (.55,.60,.65,.70,.75,.80,.85):
+                      vm=evaluate(val,v,threshold,g)
+                      if vm["n"]>=30 and vm["net_R"]>0 and vm["stress_R"]>0 and vm["winrate"]>=.75:
+                          candidates.append((vm["lower95"],vm["net_R"],threshold))
+                      emit(month,name,threshold,evaluate(test,t,threshold,g),"fixed_threshold_test")
+                  if candidates:
+                      threshold=max(candidates)[2]
+                      emit(month,name,threshold,evaluate(test,t,threshold,g),"selected_test")
+                  else:
+                      emit(month,name,None,evaluate(test,np.zeros(len(test)),1.0,g),"selected_test_no_eligible_validation")
+          print("RESEARCH_FINISHED",flush=True)
+          
+          PY
