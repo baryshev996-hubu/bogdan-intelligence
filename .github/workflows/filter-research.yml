@@ -1,0 +1,117 @@
+name: isolated-filter-research
+on:
+  push:
+    branches: [research/filter-relaxation-20261127]
+permissions:
+  contents: read
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install aiohttp
+      - name: Historical comparison (no secrets or live trading)
+        run: |
+          python -u - <<'PY'
+          import bisect, collections, datetime as dt, io, csv, zipfile, urllib.request, concurrent.futures, json, inspect, math
+          from app import signal_engine as se
+          from app.signal_quality import assess_quality
+          from app.analyst import market_context, net_move
+          from app.backtest import simulate_trade
+          UTC=dt.timezone.utc
+          def ts(s): return int(dt.datetime.fromisoformat(s).replace(tzinfo=UTC).timestamp()*1000)
+          start, split, end=map(ts,("2026-10-01","2026-11-01","2026-11-26"))
+          symbols=["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","LTCUSDT","LINKUSDT","DOGEUSDT"]
+          base="https://data.binance.vision/data/futures/um"
+          def acquire(sym):
+              result=[]
+              for stamp,kind in [("2026-09","monthly"),("2026-10","monthly")]+[(f"2026-11-{d:02}","daily") for d in range(1,26)]:
+                  url=f"{base}/{kind}/klines/{sym}/5m/{sym}-5m-{stamp}.zip"
+                  with urllib.request.urlopen(url,timeout=20) as f: payload=f.read()
+                  with zipfile.ZipFile(io.BytesIO(payload)) as z:
+                      for row in csv.reader(io.TextIOWrapper(z.open(z.namelist()[0]))):
+                          if not row[0].isdigit(): continue
+                          t=int(row[0]); t=t//1000 if t>10**14 else t
+                          result.append(dict(open_time=t,close_time=t+299999,open=float(row[1]),high=float(row[2]),low=float(row[3]),close=float(row[4]),volume=float(row[5]),taker_buy_volume=float(row[9])))
+              bars=sorted({b["open_time"]:b for b in result}.values(),key=lambda b:b["open_time"])
+              print("DATA",sym,len(bars),flush=True)
+              return sym,bars
+          def aggregate(bars,n):
+              groups=collections.defaultdict(list)
+              for b in bars: groups[b["open_time"]//(n*300000)].append(b)
+              return [dict(open_time=v[0]["open_time"],close_time=v[-1]["close_time"],open=v[0]["open"],high=max(b["high"] for b in v),low=min(b["low"] for b in v),close=v[-1]["close"],volume=sum(b["volume"] for b in v),taker_buy_volume=sum(b["taker_buy_volume"] for b in v)) for k,v in sorted(groups.items()) if len(v)==n and v[0]["open_time"]==k*n*300000 and v[-1]["close_time"]==(k+1)*n*300000-1]
+          source=inspect.getsource(se.evaluate)
+          variants={"strict":(),"volume":(("volume_ratio < 1.15","volume_ratio < 1.05"),),"body":(("body_ratio < 0.45","body_ratio < 0.35"),),"ema":(("1.25 * atr5","1.50 * atr5"),),"combined":(("volume_ratio < 1.15","volume_ratio < 1.05"),("body_ratio < 0.45","body_ratio < 0.35"),("1.25 * atr5","1.50 * atr5"),("confidence < 75","confidence < 70"))}
+          evaluators={}
+          for name,replacements in variants.items():
+              code=source
+              for old,new in replacements:
+                  assert old in code
+                  code=code.replace(old,new)
+              ns=dict(vars(se)); exec(code,ns); evaluators[name]=ns["evaluate"]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex: data=dict(ex.map(acquire,symbols))
+          hourly={s:aggregate(b,12) for s,b in data.items()}
+          btc=hourly["BTCUSDT"]; btc_times=[b["close_time"] for b in btc]
+          results=collections.defaultdict(list); counts=collections.Counter()
+          for sym,bars in data.items():
+              fifteen=aggregate(bars,3); hour=hourly[sym]; t15=[b["close_time"] for b in fifteen]; th=[b["close_time"] for b in hour]
+              next_free=collections.defaultdict(int)
+              for i,c in enumerate(bars[:-145]):
+                  t=c["close_time"]
+                  if t<start or t>=end: continue
+                  partition="train" if t<split else "holdout"
+                  boundary=split if partition=="train" else end
+                  if t+144*300000>=boundary: continue
+                  j,k,l=bisect.bisect_right(t15,t),bisect.bisect_right(th,t),bisect.bisect_right(btc_times,t)
+                  if min(i,j,k,l)<60: continue
+                  hist={"5m":bars[max(0,i-239):i+1],"15m":fifteen[max(0,j-240):j],"1h":hour[max(0,k-240):k]}
+                  if any(hist[tf][-1]["close_time"]!=(t+1)//se.INTERVAL_MS[tf]*se.INTERVAL_MS[tf]-1 for tf in se.INTERVALS): continue
+                  ctx=None
+                  for name,fn in evaluators.items():
+                      key=(partition,name)
+                      if i<next_free[key]: continue
+                      sig=fn(sym,hist,as_of_ms=t)
+                      if not sig: continue
+                      if ctx is None: ctx=market_context(c,hist["1h"],btc[max(0,l-240):l])
+                      score,reason=assess_quality(sig,ctx,hist)
+                      if reason: continue
+                      counts[key]+=1
+                      entry=bars[i+1]["open"]
+                      if not sig["entry_zone"][0]<=entry<=sig["entry_zone"][1]: continue
+                      # next candle open proxy for current quote; keep original stop and targets, recompute actual R.
+                      risk=abs(entry-sig["stop"]); direction=1 if sig["side"]=="LONG" else -1
+                      if risk<=0 or direction*(entry-sig["stop"])<=0 or direction*(sig["targets"][0]-entry)<=0: continue
+                      # exact price-based weighted partial exits, using original target levels.
+                      rem=1.; realized=0.; stop=sig["stop"]; hit1=hit2=False; original=abs(sig["entry"]-sig["stop"])
+                      def pnl(px): return net_move(sig["side"],entry,px)/risk
+                      future=bars[i+1:i+145]
+                      if len(future)<144 or future[-1]["open_time"]-future[0]["open_time"]!=143*300000: continue
+                      for off,b in enumerate(future):
+                          if (b["low"]<=stop if direction==1 else b["high"]>=stop):
+                              fill=min(stop,b["open"]) if direction==1 else max(stop,b["open"])
+                              realized+=rem*pnl(fill); rem=0; break
+                          def hit(px): return b["high"]>=px if direction==1 else b["low"]<=px
+                          a,z,q=sig["targets"]
+                          if not hit1 and hit(a):
+                              realized+=.7*pnl(a);rem-=.7;hit1=True;stop=sig["entry"]+direction*.1*original
+                          if hit1 and not hit2 and hit(z):
+                              realized+=.2*pnl(z);rem-=.2;hit2=True;stop=a
+                          if hit2 and hit(q):
+                              realized+=rem*pnl(q);rem=0;break
+                          if hit2:
+                              stop=max(stop,b["low"]-.15*original) if direction==1 else min(stop,b["high"]+.15*original)
+                      if rem>0: realized+=rem*pnl(future[-1]["close"])
+                      results[key].append((future[off]["close_time"],realized))
+                      next_free[key]=i+off+2
+              print("PROCESSED",sym,flush=True)
+          for p in ("train","holdout"):
+              for name in variants:
+                  key=(p,name); vals=[v for t,v in sorted(results[key])]; wins=[v for v in vals if v>0]; losses=[v for v in vals if v<0]; eq=peak=dd=0
+                  for v in vals: eq+=v; peak=max(peak,eq);dd=max(dd,peak-eq)
+                  print("RESULT",json.dumps(dict(period=p,variant=name,candidates=counts[key],trades=len(vals),wins=len(wins),net_R=round(sum(vals),4),avg_R=round(sum(vals)/len(vals),4) if vals else None,pf=round(sum(wins)/-sum(losses),4) if losses else None,drawdown_R=round(dd,4))),flush=True)
+          
+          PY
