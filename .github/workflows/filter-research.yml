@@ -7,7 +7,12 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,9 +20,11 @@ jobs:
           python-version: '3.12'
       - run: pip install aiohttp
       - name: Historical comparison (no secrets or live trading)
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           python -u - <<'PY'
-          import bisect, collections, datetime as dt, io, csv, zipfile, urllib.request, concurrent.futures, json, inspect, math
+          import bisect, collections, datetime as dt, io, csv, zipfile, urllib.request, concurrent.futures, json, inspect, math, os, urllib.parse, urllib.error, time
           from app import signal_engine as se
           from app.signal_quality import assess_quality
           from app.analyst import market_context, net_move
@@ -25,13 +32,31 @@ jobs:
           UTC=dt.timezone.utc
           def ts(s): return int(dt.datetime.fromisoformat(s).replace(tzinfo=UTC).timestamp()*1000)
           start, split, end=map(ts,("2026-10-01","2026-11-01","2026-11-26"))
-          symbols=["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","BNBUSDT","LTCUSDT","LINKUSDT","DOGEUSDT"]
+          universe=["BTCUSDT","ZECUSDT","SOLUSDT","ETHUSDT","XRPUSDT","HYPEUSDT","NEARUSDT","MANTRAUSDT","1000PEPEUSDT","MMTUSDT","BIGTIMEUSDT","BNBUSDT","DOGEUSDT","EVAAUSDT","PIEVERSEUSDT","BULLAUSDT","SSVUSDT","PAXGUSDT","ENAUSDT","VVVUSDT","SUIUSDT","ADAUSDT","INITUSDT","UNIUSDT","LINKUSDT","WLDUSDT","ELSAUSDT","LISTAUSDT","MOVEUSDT","AKEUSDT","AAVEUSDT","XAUTUSDT","PUMPUSDT","BLESSUSDT","BTWUSDT","LTCUSDT","XMRUSDT","TAOUSDT","INJUSDT","TRUMPUSDT","AVAXUSDT","牛来USDT","FILUSDT","BCHUSDT","TRXUSDT","BLURUSDT","ARBUSDT","LITUSDT","QNTUSDT","ZROUSDT","MEUSDT","XLMUSDT","ARIAUSDT","MOODENGUSDT","FETUSDT","DOTUSDT","MONUSDT","ONDOUSDT","TIAUSDT","OPGUSDT","SEIUSDT","GUAUSDT","1000SHIBUSDT","XPLUSDT","PROMUSDT","ATUSDT","SLXUSDT","JCTUSDT","ETHFIUSDT","HBARUSDT","CRVUSDT","ASTERUSDT","PENGUUSDT","APTUSDT","LAYERUSDT","ONEUSDT","ICPUSDT","SKYUSDT","WLFIUSDT","OPUSDT","ATOMUSDT","AIOTUSDT","BABYUSDT","DASHUSDT","PONSUSDT","1000BONKUSDT","CFGUSDT","ETCUSDT","USELESSUSDT","DOSUSDT","JUPUSDT","STRKUSDT","SKYAIUSDT","WIFUSDT","NIGHTUSDT","IDOLUSDT","ACEUSDT","RAYSOLUSDT","HUMAUSDT","PIPPINUSDT"]
+          symbols=universe[int(os.environ["SHARD"])*5:(int(os.environ["SHARD"])+1)*5]
+          download_symbols=list(dict.fromkeys(["BTCUSDT",*symbols]))
+          print("UNIVERSE",json.dumps(symbols),flush=True)
           base="https://data.binance.vision/data/futures/um"
           def acquire(sym):
               result=[]
               for stamp,kind in [("2026-09","monthly"),("2026-10","monthly")]+[(f"2026-11-{d:02}","daily") for d in range(1,26)]:
-                  url=f"{base}/{kind}/klines/{sym}/5m/{sym}-5m-{stamp}.zip"
-                  with urllib.request.urlopen(url,timeout=20) as f: payload=f.read()
+                  escaped=urllib.parse.quote(sym,safe="")
+                  url=f"{base}/{kind}/klines/{escaped}/5m/{escaped}-5m-{stamp}.zip"
+                  payload=None
+                  for attempt in range(3):
+                      try:
+                          with urllib.request.urlopen(url,timeout=30) as f: payload=f.read()
+                          break
+                      except urllib.error.HTTPError as e:
+                          if e.code==404:
+                              print("MISSING",sym,stamp,flush=True)
+                              break
+                          if attempt==2: raise
+                          time.sleep(2**attempt)
+                      except (OSError,TimeoutError):
+                          if attempt==2: raise
+                          time.sleep(2**attempt)
+                  if payload is None: continue
                   with zipfile.ZipFile(io.BytesIO(payload)) as z:
                       for row in csv.reader(io.TextIOWrapper(z.open(z.namelist()[0]))):
                           if not row[0].isdigit(): continue
@@ -53,13 +78,18 @@ jobs:
                   assert old in code
                   code=code.replace(old,new)
               ns=dict(vars(se)); exec(code,ns); evaluators[name]=ns["evaluate"]
-          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex: data=dict(ex.map(acquire,symbols))
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex: data=dict(ex.map(acquire,download_symbols))
           hourly={s:aggregate(b,12) for s,b in data.items()}
           btc=hourly["BTCUSDT"]; btc_times=[b["close_time"] for b in btc]
           results=collections.defaultdict(list); counts=collections.Counter()
-          for sym,bars in data.items():
+          for sym in symbols:
+              bars=data[sym]
+              if len(bars)<1000:
+                  print("SKIPPED",sym,len(bars),flush=True)
+                  continue
               fifteen=aggregate(bars,3); hour=hourly[sym]; t15=[b["close_time"] for b in fifteen]; th=[b["close_time"] for b in hour]
               next_free=collections.defaultdict(int)
+              coverage=collections.Counter()
               for i,c in enumerate(bars[:-145]):
                   t=c["close_time"]
                   if t<start or t>=end: continue
@@ -70,11 +100,16 @@ jobs:
                   if min(i,j,k,l)<60: continue
                   hist={"5m":bars[max(0,i-239):i+1],"15m":fifteen[max(0,j-240):j],"1h":hour[max(0,k-240):k]}
                   if any(hist[tf][-1]["close_time"]!=(t+1)//se.INTERVAL_MS[tf]*se.INTERVAL_MS[tf]-1 for tf in se.INTERVALS): continue
+                  if any(h[-1]["open_time"]-h[0]["open_time"]!=(len(h)-1)*se.INTERVAL_MS[tf] for tf,h in hist.items()): continue
+                  coverage[partition]+=1
+                  # Combined is a mathematical superset of all other variants; skip redundant evaluations.
+                  wide=evaluators["combined"](sym,hist,as_of_ms=t)
+                  if not wide: continue
                   ctx=None
                   for name,fn in evaluators.items():
                       key=(partition,name)
                       if i<next_free[key]: continue
-                      sig=fn(sym,hist,as_of_ms=t)
+                      sig=wide if name=="combined" else fn(sym,hist,as_of_ms=t)
                       if not sig: continue
                       if ctx is None: ctx=market_context(c,hist["1h"],btc[max(0,l-240):l])
                       score,reason=assess_quality(sig,ctx,hist)
@@ -107,11 +142,12 @@ jobs:
                       if rem>0: realized+=rem*pnl(future[-1]["close"])
                       results[key].append((future[off]["close_time"],realized))
                       next_free[key]=i+off+2
-              print("PROCESSED",sym,flush=True)
+              print("PROCESSED",sym,json.dumps(dict(coverage)),flush=True)
           for p in ("train","holdout"):
               for name in variants:
                   key=(p,name); vals=[v for t,v in sorted(results[key])]; wins=[v for v in vals if v>0]; losses=[v for v in vals if v<0]; eq=peak=dd=0
                   for v in vals: eq+=v; peak=max(peak,eq);dd=max(dd,peak-eq)
                   print("RESULT",json.dumps(dict(period=p,variant=name,candidates=counts[key],trades=len(vals),wins=len(wins),net_R=round(sum(vals),4),avg_R=round(sum(vals)/len(vals),4) if vals else None,pf=round(sum(wins)/-sum(losses),4) if losses else None,drawdown_R=round(dd,4))),flush=True)
+                  print("TRADE_ROWS",json.dumps(dict(period=p,variant=name,rows=results[key])),flush=True)
           
           PY
