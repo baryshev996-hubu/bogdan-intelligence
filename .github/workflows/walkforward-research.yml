@@ -1,7 +1,7 @@
-name: walkforward-ensemble-research
+name: breakout-stability-audit
 on:
   push:
-    branches: [research/walkforward-ensemble-20261127]
+    branches: [research/breakout-stability-audit-20261127]
 permissions:
   contents: read
 jobs:
@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mode: [rules, ml]
+        mode: [audit]
     env:
       MODE: ${{ matrix.mode }}
       OMP_NUM_THREADS: '2'
@@ -161,9 +161,10 @@ jobs:
               prev=(pd.Timestamp(month+"-01")-pd.offsets.MonthBegin(1)).strftime("%Y-%m")
               valstart=int(pd.Timestamp(prev+"-01",tz="UTC").timestamp()*1000)
               end=int((pd.Timestamp(month+"-01",tz="UTC")+pd.offsets.MonthBegin(1)).timestamp()*1000)
-              train=D[(D.time<valstart)&(D.exit<valstart)]
-              val=D[(D.time>=valstart)&(D.time<ts)&(D.exit<ts)]
-              test=D[(D.time>=ts)&(D.time<end)&(D.exit<end)]
+              purge=H*300000
+              train=D[D.time<valstart-purge]
+              val=D[(D.time>=valstart)&(D.time<ts-purge)]
+              test=D[(D.time>=ts)&(D.time<end-purge)]
               return train,val,test
           def emit(month,name,threshold,metrics,phase="test"):
               print("RESULT",json.dumps(dict(month=month,model=name,threshold=threshold,phase=phase,**metrics),allow_nan=False),flush=True)
@@ -189,26 +190,64 @@ jobs:
                   v,t,_=result["pooled"];result["ensemble"]=(.7*v+.3*lv,.7*t+.3*lt,None)
               return result
           print("CONFIG",json.dumps(dict(mode=MODE,symbols=len(raw),rows=len(D),features=len(FEATURES),train_start="2026-01",first_test="2026-06",last_test="2026-11",fees_each_side=.0005,slip_each_side=.0001,horizon_bars=H,rr=1.2)),flush=True)
-          for month in [f"2026-{m:02}" for m in range(6,12)]:
+          # Fixed hypotheses, descriptive audit on already examined data; not fresh confirmation.
+          def model_predict(train,b):
+              subset=train[train.breakout_gate]
+              if len(subset)<2000 or (subset.net>0).nunique()<2: raise RuntimeError("insufficient breakout training")
+              mdl=HistGradientBoostingClassifier(max_iter=80,max_leaf_nodes=15,min_samples_leaf=100,l2_regularization=3,early_stopping=False,random_state=42)
+              mdl.fit(subset[FEATURES],(subset.net>0).astype(int))
+              return mdl.predict_proba(b[FEATURES])[:,1]
+          def extract(b,score,threshold=.75,cap=None):
+              mask=np.isfinite(score)&(score>=threshold)&b.breakout_gate.to_numpy()
+              c=b.loc[mask,["time","symbol","side","net","stress","exit","btc_volatility","btc_trend","btc_ret12","m5_atr","m5_relvol","m15_flow3","h1_trend"]].copy()
+              c["score"]=score[mask]
+              c=c.sort_values(["time","score"],ascending=[True,False]).drop_duplicates(["symbol","time"])
+              busy={};active=[];rows=[]
+              for r in c.itertuples(index=False):
+                  if r.time<busy.get(r.symbol,0):continue
+                  active=[t for t in active if t>r.time]
+                  if cap is not None and len(active)>=cap:continue
+                  busy[r.symbol]=r.exit;active.append(r.exit);rows.append(r._asdict())
+              return pd.DataFrame(rows,columns=c.columns)
+          def metrics(c):
+              if not len(c):return dict(n=0,wins=0,winrate=None,net_R=0.,stress_R=0.,pf=None,dd_R=0.,lower95=None,days=0,symbols=0,top_day_share=None,top_symbol_share=None,day_bootstrap_lower95=None)
+              a=c.sort_values("exit");v=a.net.to_numpy();n=len(v);w=int((v>0).sum());p=w/n;z=1.96
+              eq=np.r_[0.,np.cumsum(v)];loss=-v[v<0].sum()
+              lower=(p+z*z/(2*n)-z*np.sqrt(p*(1-p)/n+z*z/(4*n*n)))/(1+z*z/n)
+              day=(c.time//86400000);perday=c.assign(day=day,win=c.net>0).groupby("day").win.agg(["sum","count"]).to_numpy()
+              rng=np.random.default_rng(42);draw=rng.integers(len(perday),size=(2000,len(perday)));samples=perday[draw].sum(axis=1);boot=np.quantile(samples[:,0]/samples[:,1],.025)
+              return dict(n=n,wins=w,winrate=p,net_R=float(v.sum()),stress_R=float(a.stress.sum()),pf=float(v[v>0].sum()/loss) if loss else None,dd_R=float(np.max(np.maximum.accumulate(eq)-eq)),lower95=float(lower),days=len(perday),symbols=int(c.symbol.nunique()),top_day_share=float(day.value_counts(normalize=True).iloc[0]),top_symbol_share=float(c.symbol.value_counts(normalize=True).iloc[0]),day_bootstrap_lower95=float(boot))
+          def report(month,name,c):
+              print("AUDIT",json.dumps(dict(month=month,model=name,**metrics(c)),allow_nan=False),flush=True)
+              if name=="expanding_075":
+                  for row in c.to_dict("records"):print("TRADE",json.dumps(dict(month=month,**row),allow_nan=False),flush=True)
+          shadow=[]
+          for month in [f"2026-{m:02}" for m in range(5,12)]:
               train,val,test=fold(month)
-              if min(len(train),len(val),len(test))<1000: raise RuntimeError("insufficient fold "+month)
-              if MODE=="rules":
-                  for name,mask in rules(test).items():
-                      emit(month,name,.5,evaluate(test,mask.to_numpy(dtype=float),.5))
-                  continue
-              for name,(v,t,g) in models(train,val,test).items():
-                  # Fixed, predeclared thresholds reported; selection uses only preceding validation month.
-                  candidates=[]
-                  for threshold in (.55,.60,.65,.70,.75,.80,.85):
-                      vm=evaluate(val,v,threshold,g)
-                      if vm["n"]>=30 and vm["net_R"]>0 and vm["stress_R"]>0 and vm["winrate"]>=.75:
-                          candidates.append((vm["lower95"],vm["net_R"],threshold))
-                      emit(month,name,threshold,evaluate(test,t,threshold,g),"fixed_threshold_test")
-                  if candidates:
-                      threshold=max(candidates)[2]
-                      emit(month,name,threshold,evaluate(test,t,threshold,g),"selected_test")
-                  else:
-                      emit(month,name,None,evaluate(test,np.zeros(len(test)),1.0,g),"selected_test_no_eligible_validation")
+              score=model_predict(train,test)
+              trades=extract(test,score)
+              report(month,"expanding_075",trades)
+              report(month,"expanding_065",extract(test,score,.65))
+              report(month,"expanding_075_cap3",extract(test,score,.75,3))
+              # Fixed 90-day window, same gate and threshold. No selection on this month's outcomes.
+              recent=train[train.time>=train.time.max()-90*86400000]
+              report(month,"rolling90_075",extract(test,model_predict(recent,test)))
+              # Diagnostic: compare October and November to a model frozen before June.
+              frozen=D[D.time<int(pd.Timestamp("2026-05-01",tz="UTC").timestamp()*1000)-H*300000]
+              report(month,"frozen_075",extract(test,model_predict(frozen,test)))
+              # Shadow filter learns only from already closed high-confidence candidates; no access to open outcomes.
+              combined=pd.concat([*shadow,trades],ignore_index=True)
+              selected=[];busy=[]
+              for r in trades.sort_values("time").itertuples(index=False):
+                  past=combined[(combined.exit<r.time)&(combined.time>=r.time-30*86400000)]
+                  if len(past)<30:continue
+                  p=float((past.net>0).mean())
+                  if p<.75 or past.net.sum()<=0 or past.stress.sum()<=0:continue
+                  busy=[x for x in busy if x>r.time]
+                  if len(busy)>=3:continue
+                  busy.append(r.exit);selected.append(r._asdict())
+              report(month,"shadow30_gate_cap3",pd.DataFrame(selected,columns=trades.columns))
+              shadow.append(trades)
           print("RESEARCH_FINISHED",flush=True)
           
           PY
