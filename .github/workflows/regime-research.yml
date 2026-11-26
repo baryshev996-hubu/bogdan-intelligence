@@ -1,0 +1,179 @@
+name: regime-relative-strength-2025
+on:
+  push:
+    branches: [research/regime-relative-strength-2025]
+permissions:
+  contents: read
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install numpy pandas scikit-learn
+      - name: Offline 2025 regime and expected return study
+        run: |
+          python -u - <<'PY'
+          """Predeclared exploratory 2025 walk-forward experiment. No orders or production access."""
+          import io,zipfile,urllib.request,urllib.error,concurrent.futures as cf,time,json
+          import numpy as np,pandas as pd
+          from sklearn.ensemble import HistGradientBoostingClassifier,HistGradientBoostingRegressor
+          SYMS=[s+"USDT" for s in "BTC ETH SOL XRP BNB LTC LINK DOGE ADA AVAX BCH TRX XLM DOT UNI AAVE NEAR ETC FIL ATOM HBAR ICP SUI OP ARB INJ".split()]
+          BASE="https://data.binance.vision/data/futures/um/monthly"
+          STEP=900000; H=96; TARGET=.9
+          def get(path):
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(path,timeout=30) as f:return f.read()
+                  except urllib.error.HTTPError as e:
+                      if e.code==404:return None
+                      if attempt==2:raise
+                  except (OSError,TimeoutError):
+                      if attempt==2:raise
+                  time.sleep(2**attempt)
+          def load(s):
+              a=[];fr=[];covered=set()
+              for m in range(1,13):
+                  stamp=f"2025-{m:02}"
+                  raw=get(f"{BASE}/klines/{s}/15m/{s}-15m-{stamp}.zip")
+                  if raw is None:
+                      print("MISSING_KLINE",s,stamp,flush=True);continue
+                  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                      d=pd.read_csv(z.open(z.namelist()[0]),header=None,usecols=[0,1,2,3,4,5,7,9],names=["t","o","h","l","c","v","q","buy"],low_memory=False)
+                  d=d.apply(pd.to_numeric,errors="coerce").dropna()
+                  a.append(d)
+                  raw=get(f"{BASE}/fundingRate/{s}/{s}-fundingRate-{stamp}.zip")
+                  if raw is not None:
+                      with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                          f=pd.read_csv(z.open(z.namelist()[0]),header=None,names=["t","hours","rate"])
+                      f=f.apply(pd.to_numeric,errors="coerce").dropna()
+                      if len(f):
+                          fr.append(f);covered.add(stamp)
+              if not a:return s,None,None,set()
+              d=pd.concat(a).drop_duplicates("t").sort_values("t").reset_index(drop=True)
+              d.t=np.where(d.t>10**14,d.t//1000,d.t).astype("int64")
+              d=d[(d.c>0)&(d.v>0)&(d.buy>=0)&(d.buy<=d.v)&(d.h>=d.l)].reset_index(drop=True)
+              f=pd.concat(fr).drop_duplicates("t").sort_values("t") if fr else pd.DataFrame(columns=["t","rate"])
+              print("DATA",s,len(d),"funding_months",len(covered),"funding_rows",len(f),flush=True)
+              return s,d,f,covered
+          def ema(x,n):return x.ewm(span=n,adjust=False,min_periods=n).mean()
+          def div(x,y):return x/y.replace(0,np.nan)
+          def agg(d,n):
+              x=d.assign(bucket=d.t//(n*STEP))
+              x=x.groupby("bucket").agg(t=("t","first"),last=("t","last"),o=("o","first"),h=("h","max"),l=("l","min"),c=("c","last"),v=("v","sum"),q=("q","sum"),buy=("buy","sum"),n=("t","size")).reset_index(drop=True)
+              x=x[(x.n==n)&(x["last"]-x.t==(n-1)*STEP)].copy()
+              x["time"]=x["last"]+STEP;return x
+          def feat(a,tag):
+              c=a.c;d=c.diff();h=a.h;l=a.l;v=a.v
+              tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+              atr=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+              up=d.clip(lower=0).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+              dn=(-d.clip(upper=0)).ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+              e20=ema(c,20);e50=ema(c,50);m=ema(c,12)-ema(c,26);mh=m-ema(m,9)
+              f=pd.DataFrame({"time":a.time,"atr":div(atr,c),"trend":div(e20-e50,atr),"slope":div(e20-e20.shift(3),atr),"dist":div(c-e20,atr),"rsi":100*div(up,up+dn)-50,"macd":div(mh,atr),"ret1":c.pct_change(),"ret4":c.pct_change(4),"ret24":c.pct_change(24),"vol":c.pct_change().rolling(20).std(),"volregime":div(atr,atr.rolling(100).median()),"relvol":div(v,v.shift().rolling(24).mean()),"flow":div(a.buy,v)-.5,"flow4":div(a.buy.rolling(4).sum(),v.rolling(4).sum())-.5,"body":div(c-a.o,h-l),"pos":div(c-l,h-l)-.5,"upper":div(c-h.shift().rolling(20).max(),atr),"lower":div(l.shift().rolling(20).min()-c,atr),"eff":div((c-c.shift(12)).abs(),d.abs().rolling(12).sum()),"liquidity":np.log1p(a.q.shift().rolling(24).median())})
+              return f.rename(columns={c:tag+"_"+c for c in f if c!="time"})
+          def labels(a,ix,atr,d,f,covered):
+              t=a.t.to_numpy();o=a.o.to_numpy();h=a.h.to_numpy();l=a.l.to_numpy();c=a.c.to_numpy()
+              ent=o[ix+1];risk=np.maximum(1.5*atr*c[ix],.0075*ent);stop=ent-d*risk;tp=ent+d*TARGET*risk
+              valid=(t[ix+H]-t[ix]==H*STEP)&(t[ix]-t[ix-96]==96*STEP)&np.isfinite(risk)&(risk/ent<=.04)&(stop>0)&(tp>0)
+              out=c[ix+H].copy();ex=ix+H;active=valid.copy()
+              for j in range(1,H+1):
+                  q=ix+j; sh=active&((l[q]<=stop) if d==1 else (h[q]>=stop))
+                  out[sh]=(np.minimum(stop,o[q]) if d==1 else np.maximum(stop,o[q]))[sh];ex[sh]=q[sh];active[sh]=False
+                  hit=active&((h[q]>=tp) if d==1 else (l[q]<=tp))
+                  out[hit]=tp[hit];ex[hit]=q[hit];active[hit]=False
+              et=t[ix+1];xt=t[ex]+STEP
+              ft=f.t.to_numpy(dtype=np.int64);rates=f.rate.to_numpy(dtype=float)
+              # Normalize possible microsecond archive timestamps.
+              ft=np.where(ft>10**14,ft//1000,ft)
+              cs=np.r_[0.,np.cumsum(rates)]
+              actual=d*(cs[np.searchsorted(ft,xt,side="right")]-cs[np.searchsorted(ft,et,side="right")])
+              em=pd.to_datetime(et,unit="ms",utc=True).strftime("%Y-%m")
+              xm=pd.to_datetime(xt,unit="ms",utc=True).strftime("%Y-%m")
+              known=np.isin(em,list(covered))&np.isin(xm,list(covered))
+              # For unavailable funding archives, reserve 3bp per 8h (not claimed actual funding).
+              reserve=.0003*np.ceil((xt-et)/28800000)
+              funding=np.where(known,actual,reserve)
+              def pnl(fee,slip,extra):
+                  ep=ent*(1+d*slip);xp=out*(1-d*slip)
+                  return (d*(xp-ep)-fee*(ep+xp)-ent*(funding+extra))/risk
+              return valid,pnl(.0005,.0001,0),pnl(.0007,.0002,.0002*np.ceil((xt-et)/28800000)),xt,known
+          with cf.ThreadPoolExecutor(max_workers=8) as ex: raw=dict((s,(a,f,c)) for s,a,f,c in ex.map(load,SYMS) if a is not None)
+          btc=raw["BTCUSDT"][0]
+          bf=feat(agg(btc,4),"btc")[["time","btc_ret4","btc_ret24","btc_trend","btc_volregime","btc_flow4"]]
+          parts=[]
+          for s,(a,f,cov) in raw.items():
+              a=a.assign(time=a.t+STEP)
+              ix=np.flatnonzero((a.time.to_numpy()%3600000==0)&(np.arange(len(a))>=400)&(np.arange(len(a))<len(a)-H))
+              b=feat(a,"q").iloc[ix].reset_index(drop=True)
+              for n,tag in [(4,"h"),(16,"h4")]:
+                  b=pd.merge_asof(b,feat(agg(a,n),tag),on="time",direction="backward",tolerance=(n-1)*STEP)
+              b=pd.merge_asof(b,bf,on="time",direction="backward",tolerance=0)
+              b["relative4"]=b.h_ret4-b.btc_ret4;b["relative24"]=b.h_ret24-b.btc_ret24
+              for d in [1,-1]:
+                  z=b.copy();valid,net,stress,xt,known=labels(a,ix,z.h_atr.to_numpy(),d,f,cov)
+                  z["symbol"]=s;z["side"]=d;z["net"]=net;z["stress"]=stress;z["exit"]=xt;z["funding_known"]=known
+                  for k in z.columns:
+                      if k in ("relative4","relative24") or k.split("_")[-1] in ("trend","slope","dist","rsi","macd","ret1","ret4","ret24","flow","flow4","body","pos"):z[k]*=d
+                  if d==-1:
+                      for tag in ("q","h","h4"):
+                          u=z[tag+"_upper"].copy();z[tag+"_upper"]=z[tag+"_lower"];z[tag+"_lower"]=u
+                  parts.append(z.loc[valid].replace([np.inf,-np.inf],np.nan).dropna())
+          D=pd.concat(parts,ignore_index=True)
+          for col in ("relative4","relative24","h_flow4","h_relvol","h_volregime","h_liquidity"):
+              D[col+"_rank"]=D.groupby(["time","side"])[col].rank(pct=True)
+          D=D.sort_values(["time","symbol","side"]).reset_index(drop=True)
+          FEATURES=[k for k in D if k not in ("time","symbol","side","net","stress","exit","funding_known")]
+          print("CONFIG",json.dumps(dict(symbols=len(raw),rows=len(D),features=len(FEATURES),funding_known_fraction=float(D.funding_known.mean()),horizon_h=24,rr=TARGET,test_months="2025-07..12")),flush=True)
+          def evaluate(b,scores,mask):
+              x=b.loc[mask,["time","symbol","side","exit","net","stress","funding_known"]].copy();x["score"]=scores[mask]
+              x=x.sort_values(["time","score"],ascending=[True,False]).drop_duplicates(["symbol","time"])
+              busy={};rows=[]
+              for r in x.itertuples(index=False):
+                  if r.time<busy.get(r.symbol,0):continue
+                  busy[r.symbol]=r.exit;rows.append((r.exit,r.net,r.stress,r.funding_known))
+              if not rows:return dict(n=0,wins=0,winrate=None,net_R=0.,stress_R=0.,pf=None,dd_R=0.,lower95=None,funding_known=None)
+              a=np.array(sorted(rows));v=a[:,1];p=float((v>0).mean());n=len(v);z=1.96;eq=np.r_[0,np.cumsum(v)];loss=-v[v<0].sum()
+              return dict(n=n,wins=int((v>0).sum()),winrate=p,net_R=float(v.sum()),stress_R=float(a[:,2].sum()),pf=float(v[v>0].sum()/loss) if loss else None,dd_R=float(np.max(np.maximum.accumulate(eq)-eq)),lower95=float((p+z*z/(2*n)-z*np.sqrt(p*(1-p)/n+z*z/(4*n*n)))/(1+z*z/n)),funding_known=float(a[:,3].mean()))
+          def report(m,model,phase,threshold,stats):
+              print("RESULT",json.dumps(dict(month=m,model=model,phase=phase,threshold=threshold,**stats),allow_nan=False),flush=True)
+          def timestamp(m):return int(pd.Timestamp(m,tz="UTC").timestamp()*1000)
+          for m in range(7,13):
+              month=f"2025-{m:02}";st=timestamp(month+"-01");vs=timestamp(f"2025-{m-1:02}-01");end=timestamp(f"2025-{m+1:02}-01" if m<12 else "2026-01-01")
+              train=D[(D.time<vs)&(D.exit<vs)];val=D[(D.time>=vs)&(D.time<st)&(D.exit<st)];test=D[(D.time>=st)&(D.time<end)&(D.exit<end)]
+              assert min(len(train),len(val),len(test))>1000
+              # benchmark: relative strength plus confirmed multi-timeframe trend and flow.
+              rule=((test.relative24_rank>=.8)&(test.h_trend>0)&(test.h4_trend>0)&(test.h_flow4>0)&(test.h_relvol>1.1)&(test.q_body>0)).to_numpy()
+              report(month,"relative_strength_rule","test",None,evaluate(test,test.relative24_rank.to_numpy(),rule))
+              models=[("global",None),("trend_regime","trend")]
+              for name,gate in models:
+                  def g(x):return ((x.h_trend>0)&(x.h4_trend>0)&(x.relative24_rank>.6)&(x.h_flow4>0)).to_numpy() if gate else np.ones(len(x),dtype=bool)
+                  tr=train.loc[g(train)]
+                  clf=HistGradientBoostingClassifier(max_iter=70,max_leaf_nodes=15,min_samples_leaf=120,l2_regularization=5,early_stopping=False,random_state=42)
+                  reg=HistGradientBoostingRegressor(max_iter=70,max_leaf_nodes=15,min_samples_leaf=120,l2_regularization=5,early_stopping=False,random_state=42)
+                  clf.fit(tr[FEATURES],(tr.net>0).astype(int));reg.fit(tr[FEATURES],tr.stress.clip(-3,1))
+                  pv=clf.predict_proba(val[FEATURES])[:,1];pt=clf.predict_proba(test[FEATURES])[:,1];rv=reg.predict(val[FEATURES]);rt=reg.predict(test[FEATURES])
+                  candidates=[]
+                  for p in (.6,.65,.7,.75,.8):
+                      for r in (.1,.25):
+                          stat=evaluate(val,pv,g(val)&(pv>=p)&(rv>=r))
+                          if stat["n"]>=30 and stat["winrate"]>=.75 and stat["net_R"]>0 and stat["stress_R"]>0:
+                              candidates.append((stat["lower95"],stat["stress_R"],p,r))
+                  if candidates:
+                      _,_,p,r=max(candidates)
+                      report(month,name,"selected_test",[p,r],evaluate(test,pt,g(test)&(pt>=p)&(rt>=r)))
+                  else:
+                      report(month,name,"no_eligible_validation",None,evaluate(test,pt,np.zeros(len(test),dtype=bool)))
+                  # Fixed benchmark for diagnostic only, never selected using test results.
+                  for p,r in ((.65,.1),(.75,.1),(.75,.25)):
+                      report(month,name,"fixed_diagnostic",[p,r],evaluate(test,pt,g(test)&(pt>=p)&(rt>=r)))
+          print("RESEARCH_FINISHED",flush=True)
+          
+          PY
