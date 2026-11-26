@@ -22,7 +22,7 @@ if __name__ == "__main__":
 from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, SIGNAL_ALERT_SUFFIX, evaluate, format_signal
 from app.analyst import market_context
 from app.signal_quality import assess_quality, VERSION as QUALITY_VERSION
-from app.leverage import build_leverage_paper_signal
+from app.leverage import build_structural_paper_signal
 from app.signal_delivery import queue_signal, deliver_signals
 from app.market_intel import run_market_intelligence
 from app.arkham_intel import run_arkham_monitor
@@ -530,15 +530,17 @@ async def binance_signal_monitor(session, symbols):
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
         if leverage_paper_book.active():
-            leverage_signal = build_leverage_paper_signal(signal, leverage_paper_book.state["balance"])
+            leverage_signal = build_structural_paper_signal(signal, leverage_paper_book.state["balance"])
             if leverage_signal:
                 leverage_opened = leverage_paper_book.open_trade(leverage_signal)
                 if leverage_opened:
                     log.info(
-                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | margin=$20 | leverage=%sx | modeled_stop_risk<=0.25%% | TP=1.00/1.25/1.50%% | status=%s",
-                        leverage_signal["side"], symbol, leverage_signal["paper_leverage"],
+                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | policy=structural-risk-v2 | margin_cap=$20 | planned_margin=$%.4f | nominal_leverage=%sx | planned_loss=$%.4f | TP=1.00/1.25/1.50%% | status=%s",
+                        leverage_signal["side"], symbol, leverage_signal["paper_margin"], leverage_signal["paper_leverage"], leverage_signal["paper_planned_loss"],
                         leverage_paper_book.status()
                     )
+            else:
+                log.info("PAPER LEVERAGE QUALITY SKIP | %s %s | structural risk or net reward not eligible", signal["side"], symbol)
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
         if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
@@ -808,7 +810,7 @@ async def main():
              paper_sprint_v3_book.status(), paper_sprint_v3_book.state["ends_at"])
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
-    log.info("PAPER LEVERAGE CHALLENGE | %s | margin_per_trade=$20 | leverage=10-20x | risk=0.25%% | max_open=5 | TP=1.00/1.25/1.50%%",
+    log.info("PAPER LEVERAGE CHALLENGE | %s | policy=structural-risk-v2 | margin_cap=$20 | nominal_leverage=10x | risk=0.25%% | max_open=5 | TP=1.00/1.25/1.50%%",
              leverage_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
