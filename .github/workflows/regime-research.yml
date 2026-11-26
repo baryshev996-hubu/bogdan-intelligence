@@ -2,6 +2,9 @@ name: regime-relative-strength-2025
 on:
   push:
     branches: [research/regime-relative-strength-2025]
+concurrency:
+  group: regime-relative-strength-2025
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -119,18 +122,18 @@ jobs:
               b["relative4"]=b.h_ret4-b.btc_ret4;b["relative24"]=b.h_ret24-b.btc_ret24
               for d in [1,-1]:
                   z=b.copy();valid,net,stress,xt,known=labels(a,ix,z.h_atr.to_numpy(),d,f,cov)
-                  z["symbol"]=s;z["side"]=d;z["net"]=net;z["stress"]=stress;z["exit"]=xt;z["funding_known"]=known
+                  z["symbol"]=s;z["side"]=d;z["net"]=net;z["stress"]=stress;z["exit"]=xt;z["funding_known"]=known;z["valid_label"]=valid
                   for k in z.columns:
                       if k in ("relative4","relative24") or k.split("_")[-1] in ("trend","slope","dist","rsi","macd","ret1","ret4","ret24","flow","flow4","body","pos"):z[k]*=d
                   if d==-1:
                       for tag in ("q","h","h4"):
                           u=z[tag+"_upper"].copy();z[tag+"_upper"]=z[tag+"_lower"];z[tag+"_lower"]=u
-                  parts.append(z.loc[valid].replace([np.inf,-np.inf],np.nan).dropna())
+                  parts.append(z.replace([np.inf,-np.inf],np.nan))
           D=pd.concat(parts,ignore_index=True)
           for col in ("relative4","relative24","h_flow4","h_relvol","h_volregime","h_liquidity"):
               D[col+"_rank"]=D.groupby(["time","side"])[col].rank(pct=True)
-          D=D.sort_values(["time","symbol","side"]).reset_index(drop=True)
-          FEATURES=[k for k in D if k not in ("time","symbol","side","net","stress","exit","funding_known")]
+          D=D.loc[D.valid_label].dropna().sort_values(["time","symbol","side"]).reset_index(drop=True)
+          FEATURES=[k for k in D if k not in ("time","symbol","side","net","stress","exit","funding_known","valid_label")]
           print("CONFIG",json.dumps(dict(symbols=len(raw),rows=len(D),features=len(FEATURES),funding_known_fraction=float(D.funding_known.mean()),horizon_h=24,rr=TARGET,test_months="2025-07..12")),flush=True)
           def evaluate(b,scores,mask):
               x=b.loc[mask,["time","symbol","side","exit","net","stress","funding_known"]].copy();x["score"]=scores[mask]
@@ -147,7 +150,8 @@ jobs:
           def timestamp(m):return int(pd.Timestamp(m,tz="UTC").timestamp()*1000)
           for m in range(7,13):
               month=f"2025-{m:02}";st=timestamp(month+"-01");vs=timestamp(f"2025-{m-1:02}-01");end=timestamp(f"2025-{m+1:02}-01" if m<12 else "2026-01-01")
-              train=D[(D.time<vs)&(D.exit<vs)];val=D[(D.time>=vs)&(D.time<st)&(D.exit<st)];test=D[(D.time>=st)&(D.time<end)&(D.exit<end)]
+              purge=H*STEP
+              train=D[D.time<vs-purge];val=D[(D.time>=vs)&(D.time<st-purge)];test=D[(D.time>=st)&(D.time<end-purge)]
               assert min(len(train),len(val),len(test))>1000
               # benchmark: relative strength plus confirmed multi-timeframe trend and flow.
               rule=((test.relative24_rank>=.8)&(test.h_trend>0)&(test.h4_trend>0)&(test.h_flow4>0)&(test.h_relvol>1.1)&(test.q_body>0)).to_numpy()
