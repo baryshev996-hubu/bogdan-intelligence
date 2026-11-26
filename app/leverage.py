@@ -68,3 +68,14 @@ def build_structural_paper_signal(signal, balance):
                 paper_entry_policy="structural-risk-v2",
                 paper_margin=qty * filled_entry / leverage,
                 paper_planned_loss=qty * loss_per_unit)
+
+
+def recent_paper_loss(signal, closed_trades, now, cooldown_seconds=3600):
+    """Do not immediately repeat the same losing setup in the paper book."""
+    return any(
+        trade.get("symbol") == signal.get("symbol")
+        and trade.get("side") == signal.get("side")
+        and float(trade.get("net_pnl", 0)) < 0
+        and 0 <= now - float(trade.get("closed_at") or 0) < cooldown_seconds
+        for trade in closed_trades
+    )
