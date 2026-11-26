@@ -21,6 +21,7 @@ if __name__ == "__main__":
 
 from app.signal_engine import INTERVAL_MS, INTERVALS, MAX_CANDLES, SIGNAL_ALERT_SUFFIX, evaluate, format_signal
 from app.analyst import market_context
+from app.signal_quality import assess_quality, VERSION as QUALITY_VERSION
 from app.leverage import build_leverage_paper_signal
 from app.signal_delivery import queue_signal, deliver_signals
 from app.market_intel import run_market_intelligence
@@ -651,14 +652,47 @@ async def binance_signal_monitor(session, symbols):
         scan_evaluations += 1
         signal = evaluate(symbol, histories[symbol], diagnostics=scan_rejections)
         if signal:
-            scan_signals += 1
             signal["market_context"] = market_context(
                 candle, histories[symbol]["1h"], histories.get("BTCUSDT", {}).get("1h", ())
             )
             context = signal["market_context"]
-            log.info("SIGNAL ANALYSIS | %s %s | buy_share=%s | btc_change=%s | relative=%s",
-                     signal["side"], symbol, context["buy_share"], context["btc_change"], context["relative"])
-            await dispatch_signal(signal)
+            score, reason = assess_quality(signal, context, histories[symbol])
+            if reason is None:
+                # The closed candle is only a setup, not a current executable price.
+                # Check the current public best ask/bid before notification or new PAPER entry.
+                if int(time.time() * 1000) - candle["close_time"] > 90000:
+                    reason = "quality_entry_stale"
+                else:
+                    try:
+                        async with session.get(
+                            "https://fapi.binance.com/fapi/v1/ticker/bookTicker",
+                            params={"symbol": symbol}, timeout=5
+                        ) as response:
+                            response.raise_for_status()
+                            quote = await response.json(content_type=None)
+                        executable = float(quote["askPrice"] if signal["side"] == "LONG" else quote["bidPrice"])
+                        if (not signal["entry_zone"][0] <= executable <= signal["entry_zone"][1]
+                                or int(time.time() * 1000) - candle["close_time"] > 90000):
+                            reason = "quality_entry_outside_zone"
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        reason = "quality_quote_unavailable"
+            if reason:
+                scan_rejections[reason] += 1
+                log.info("SIGNAL QUALITY REJECT | %s %s | reason=%s | score=%s | buy_share=%s | btc_change=%s | relative=%s",
+                         signal["side"], symbol, reason, score, context["buy_share"], context["btc_change"], context["relative"])
+            else:
+                signal["confidence"] = score
+                signal["reasons"].extend([
+                    "Направление подтверждено потоком 5m/15m, относительной силой и импульсом",
+                    "Цена best bid/ask проверена внутри зоны перед отправкой",
+                    "Оценка качества условий, не вероятность прибыли",
+                ])
+                scan_signals += 1
+                log.info("SIGNAL QUALITY PASS | %s %s | score=%s | buy_share=%s | btc_change=%s | relative=%s",
+                         signal["side"], symbol, score, context["buy_share"], context["btc_change"], context["relative"])
+                await dispatch_signal(signal)
 
         if now_mono - last_scan_report >= 60:
             top_rejections = scan_rejections.most_common(6)
@@ -762,6 +796,7 @@ async def main():
     connector = aiohttp.TCPConnector(limit=40)
 
     log.info("BOOT | strict Telegram allowlist enabled | telegram_recipients=%d", len(CHAT_IDS))
+    log.info("SIGNAL QUALITY ACTIVE | %s | directional confirmation required | live quote check | baseline sprints isolated", QUALITY_VERSION)
     log.info("ALLOWED ALERTS | LONG, SHORT, LARGE EXECUTION (Hyperliquid), ORDER FLOW, UPCOMING LISTINGS, EARLY INTELLIGENCE")
     log.info("DISABLED ALERTS | CRYPTO MOVE, SEC, RSS, ticker, funding, OI, derivatives chatter")
     log.info("SIGNAL DELIVERY | enabled=%s | one signal per closed candle | recipients=%d",
