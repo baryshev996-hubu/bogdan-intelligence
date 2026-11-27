@@ -218,7 +218,7 @@ jobs:
               rule=((te.m5_pos>.2)&(te.m15_flow3>0)).to_numpy()
               for name,mask,score in [("rule",rule,te.m5_relvol.to_numpy()),("raw075",pt>=.75,pt),("cal075",p>=.75,p),("cal075_btc", (p>=.75)&regime,p),("rule_btc",rule&regime,te.m5_relvol.to_numpy())]:
                   print("COMPARE",json.dumps(dict(month=month,model=name,**assess(te,mask,score)),allow_nan=False),flush=True)
-              print("CALIBRATION",json.dumps(dict(month=month,n=len(te),raw_brier=float(np.mean((pt-(te.net>0))**2)),cal_brier=float(np.mean((p-(te.net>0))**2))),flush=True)
+              print("CALIBRATION",json.dumps(dict(month=month,n=len(te),raw_brier=float(np.mean((pt-(te.net>0))**2)),cal_brier=float(np.mean((p-(te.net>0))**2)))),flush=True)
           print("RESEARCH_FINISHED",flush=True)
           
           PY
