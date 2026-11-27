@@ -5,7 +5,9 @@ and Binance Futures order-flow alerts can be delivered. No spot ticker,
 SEC, RSS, funding, OI, or generic market notifications are sent.
 """
 import asyncio
+import json
 import logging
+import re
 import os
 import sys
 import time
@@ -220,6 +222,9 @@ def is_allowed_telegram_alert(message: str) -> bool:
     lines = [line.strip() for line in str(message).splitlines() if line.strip()]
     if not lines:
         return False
+
+    if re.fullmatch(r"🟡 Возможен (?:LONG|SHORT) по [A-Z0-9]{1,30}USDT, до закрытия 30 секунд", message):
+        return True
 
     header = lines[0].upper()
     # Remove only the decorative icons used by our own formatters.
@@ -604,9 +609,6 @@ async def binance_signal_monitor(session, symbols):
         for timeframe in INTERVALS
     ))
 
-    # Binance WebSocket sessions in this Railway region establish but deliver
-    # zero market events. Use public REST klines as the reliable market-data source.
-    # 300 limit=3 requests every 20 seconds remain within Binance rate limits.
     async def process_closed_5m_candle(symbol, candle):
         nonlocal scan_evaluations, scan_signals, last_scan_report
         now_mono = time.monotonic()
@@ -711,17 +713,106 @@ async def binance_signal_monitor(session, symbols):
             scan_signals = 0
             last_scan_report = now_mono
 
+    closed_stream = {}
+    preview_checked = {}
+    preview_tasks = set()
+    close_event = asyncio.Event()
+    last_wakeup = 0
+
+    def preview(symbol, candle, now_ms):
+        if (not ENABLE_SIGNAL_DELIVERY or symbol not in signal_symbols
+                or (SIGNAL_DELIVERY_SYMBOLS and symbol not in SIGNAL_DELIVERY_SYMBOLS)):
+            return
+        if not 28000 <= candle["close_time"] + 1 - now_ms <= 30500:
+            return
+        if preview_checked.get(symbol) == candle["open_time"]:
+            return
+        preview_checked[symbol] = candle["open_time"]
+        snapshot = dict(histories[symbol])
+        if not snapshot["5m"] or snapshot["5m"][-1]["open_time"] + 300000 != candle["open_time"]:
+            return
+        # Use only information available now. Never insert the open bar in live histories.
+        partial = dict(candle, close_time=now_ms)
+        snapshot["5m"] = [*snapshot["5m"], partial][-MAX_CANDLES:]
+        candidate = evaluate(symbol, snapshot, as_of_ms=now_ms)
+        if not candidate:
+            return
+        context = market_context(partial, snapshot["1h"], histories.get("BTCUSDT", {}).get("1h", ()))
+        _, reason = assess_quality(candidate, context, snapshot)
+        if reason is not None:
+            return
+        message = f"🟡 Возможен {candidate['side']} по {symbol}, до закрытия 30 секунд"
+
+        async def send_preview():
+            try:
+                await asyncio.wait_for(telegram_send(session, message), timeout=5)
+            except asyncio.TimeoutError:
+                log.info("SIGNAL PREVIEW TIMEOUT | %s", symbol)
+            except Exception:
+                log.exception("SIGNAL PREVIEW FAILED | %s", symbol)
+
+        task = asyncio.create_task(send_preview())
+        preview_tasks.add(task)
+        task.add_done_callback(preview_tasks.discard)
+
+    async def read_stream(group):
+        nonlocal last_wakeup
+        streams = "/".join(f"{symbol.lower()}@kline_{tf}" for symbol in group for tf in INTERVALS)
+        url = "wss://fstream.binance.com/market/stream?streams=" + streams
+        while True:
+            try:
+                async with session.ws_connect(url, heartbeat=25, receive_timeout=45) as ws:
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            break
+                        data = json.loads(msg.data)["data"]
+                        bar = data["k"]
+                        tf, symbol = bar["i"], data["s"]
+                        now_ms = int(time.time() * 1000)
+                        if not bar["x"] and (tf != "5m" or not 28000 <= bar["T"] + 1 - now_ms <= 30500):
+                            continue
+                        candle = {"open_time": bar["t"], "close_time": bar["T"],
+                                  "open": float(bar["o"]), "high": float(bar["h"]),
+                                  "low": float(bar["l"]), "close": float(bar["c"]),
+                                  "volume": float(bar["v"]), "taker_buy_volume": float(bar["V"])}
+                        if not bar["x"]:
+                            preview(symbol, candle, now_ms)
+                            continue
+                        closed_stream[symbol, tf] = candle
+                        if tf == "5m" and bar["T"] > last_wakeup and now_ms - bar["T"] < 5000:
+                            last_wakeup = bar["T"]
+                            close_event.set()
+                            log.info("SIGNAL WS CLOSE | lag_ms=%d", now_ms - bar["T"] - 1)
+            except Exception as exc:
+                log.warning("SIGNAL WS RECONNECT | %s", type(exc).__name__)
+            await asyncio.sleep(2)
+
     poll_semaphore = asyncio.Semaphore(20)
     poll_interval_seconds = 20
     closed_5m_candles = 0
     last_poll_health = time.monotonic()
 
-    async def poll_symbol_timeframe(symbol, timeframe):
+    async def poll_symbol_timeframe(symbol, timeframe, fast):
         nonlocal closed_5m_candles
         async with poll_semaphore:
             try:
+                history = histories[symbol][timeframe]
+                step = INTERVAL_MS[timeframe]
+                expected = int(time.time() * 1000) // step * step - step
+                if fast and history:
+                    latest = history[-1]["open_time"]
+                    if latest == expected:
+                        return True, 0
+                    bar = closed_stream.get((symbol, timeframe))
+                    if bar and latest + step == expected == bar["open_time"]:
+                        store_closed_candle(history, bar)
+                        if timeframe == "5m":
+                            closed_5m_candles += 1
+                            await process_closed_5m_candle(symbol, bar)
+                        return True, 1
                 url = "https://fapi.binance.com/fapi/v1/klines"
                 params = {"symbol": symbol, "interval": timeframe, "limit": 3}
+                request_ms = int(time.time() * 1000)
                 async with session.get(url, params=params, timeout=15) as response:
                     response.raise_for_status()
                     rows = await response.json(content_type=None)
@@ -752,7 +843,7 @@ async def binance_signal_monitor(session, symbols):
                         "taker_buy_volume": float(row[9]) if len(row) > 9 else None,
                         "close_time": int(row[6]),
                     }
-                    if candle["close_time"] >= now_ms or candle["open_time"] <= latest_open_time:
+                    if candle["close_time"] >= request_ms or candle["open_time"] <= latest_open_time:
                         continue
                     store_closed_candle(history, candle)
                     latest_open_time = candle["open_time"]
@@ -771,26 +862,43 @@ async def binance_signal_monitor(session, symbols):
     log.info("BINANCE REST SCANNER STARTED | symbols=%d | requests_per_cycle=%d | concurrency=20 | cycle=%ss | intervals=%s",
              len(symbols), len(symbols) * len(INTERVALS), poll_interval_seconds, ",".join(INTERVALS))
 
-    while True:
-        cycle_started = time.monotonic()
-        # Update slower context first so each 5m evaluation sees the latest
-        # fully closed 15m and 1h candles from the same polling cycle.
-        poll_order = tuple(tf for tf in ("15m", "1h", "5m") if tf in INTERVALS)
-        results = []
-        for timeframe in poll_order:
-            results.extend(await asyncio.gather(*(poll_symbol_timeframe(symbol, timeframe) for symbol in symbols)))
-        successful = sum(1 for ok, _ in results if ok)
-        failed = len(results) - successful
-        new_candles = sum(count for _, count in results)
-        elapsed = time.monotonic() - cycle_started
+    readers = [asyncio.create_task(read_stream(symbols[i:i+20])) for i in range(0, len(symbols), 20)]
+    try:
+        while True:
+            fast = close_event.is_set()
+            close_event.clear()
+            if fast:
+                await asyncio.sleep(0.45)  # Collect simultaneous final bars across stream shards.
+            cycle_started = time.monotonic()
+            # Update slower context first so each 5m evaluation sees the latest
+            # fully closed 15m and 1h candles from the same polling cycle.
+            poll_order = tuple(tf for tf in ("15m", "1h", "5m") if tf in INTERVALS)
+            results = []
+            for timeframe in poll_order:
+                results.extend(await asyncio.gather(*(poll_symbol_timeframe(symbol, timeframe, fast) for symbol in symbols)))
+            successful = sum(1 for ok, _ in results if ok)
+            failed = len(results) - successful
+            new_candles = sum(count for _, count in results)
+            elapsed = time.monotonic() - cycle_started
 
-        if time.monotonic() - last_poll_health >= 60:
-            log.info("BINANCE REST POLL HEALTH | symbols=%d | requests=%d | ok=%d | errors=%d | new_closed_candles=%d | new_5m=%d | cycle_seconds=%.1f",
-                     len(symbols), len(results), successful, failed, new_candles,
-                     closed_5m_candles, elapsed)
-            last_poll_health = time.monotonic()
+            if time.monotonic() - last_poll_health >= 60:
+                log.info("BINANCE REST POLL HEALTH | symbols=%d | requests=%d | ok=%d | errors=%d | new_closed_candles=%d | new_5m=%d | cycle_seconds=%.1f",
+                         len(symbols), len(results), successful, failed, new_candles,
+                         closed_5m_candles, elapsed)
+                last_poll_health = time.monotonic()
 
-        await asyncio.sleep(max(1.0, poll_interval_seconds - elapsed))
+            if fast:
+                log.info("SIGNAL WS SCAN | candles=%d | close_to_complete_ms=%d",
+                         new_candles, int(time.time()*1000) - last_wakeup - 1)
+            try:
+                await asyncio.wait_for(close_event.wait(), timeout=max(1.0, poll_interval_seconds - elapsed))
+            except asyncio.TimeoutError:
+                pass
+    finally:
+        pending = [*readers, *preview_tasks]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def main():
@@ -862,3 +970,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
