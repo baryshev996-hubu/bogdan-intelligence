@@ -33,7 +33,7 @@ def trades(bars, funding, sym):
     atr = pd.concat([bars.high-bars.low,(bars.high-prev).abs(),(bars.low-prev).abs()],axis=1).max(axis=1).rolling(14).mean().to_numpy()
     down = (l < lo) & (c > lo)
     up = (h > hi) & (c < hi)
-    share = np.divide(buy,v,out=np.full_like(buy,0.5),where=v>0)
+    share = np.divide(buy,v,out=np.full(len(buy),0.5),where=v>0)
     dates = pd.to_datetime(t,unit="ms",utc=True)
     ft = funding.calc_time.to_numpy()
     fr = funding.last_funding_rate.to_numpy()
