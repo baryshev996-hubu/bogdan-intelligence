@@ -1,0 +1,24 @@
+Columns: month variant trades net_win_pct sum_net_R sum_stress_R
+Simulated fills; overlapping positions across symbols. Funding valued at bar open. Fee+slippage per side 7 bps; stress 12 bps. Stops 1 ATR, target 1.5 ATR, max holding 1h.
+coverage BTCUSDT 52416 546
+coverage ETHUSDT 52416 546
+coverage SOLUSDT 52416 546
+coverage XRPUSDT 52416 546
+2024-01 against_flow 657 32.0 -618.9 -1014.7
+2024-01 all 3513 36.7 -2456.0 -4156.7
+2024-01 with_flow 259 34.7 -228.0 -383.8
+2024-02 against_flow 752 35.2 -686.3 -1176.5
+2024-02 all 3418 35.5 -2738.3 -4638.6
+2024-02 with_flow 324 35.2 -291.8 -502.8
+2024-03 against_flow 580 39.1 -361.3 -624.6
+2024-03 all 3600 39.1 -1800.5 -3094.0
+2024-03 with_flow 272 38.2 -174.1 -295.4
+2024-04 against_flow 586 38.4 -397.9 -670.0
+2024-04 all 3479 38.1 -2031.6 -3401.0
+2024-04 with_flow 301 37.2 -206.7 -346.2
+2024-05 against_flow 823 36.5 -669.4 -1158.8
+2024-05 all 3551 38.3 -2516.8 -4361.7
+2024-05 with_flow 405 39.0 -318.5 -558.3
+2024-06 against_flow 878 29.7 -986.5 -1718.3
+2024-06 all 3362 32.9 -3261.9 -5679.9
+2024-06 with_flow 440 30.9 -497.2 -874.9
