@@ -78,20 +78,87 @@ orderflow_paper_book = PaperBook(
     label="ORDERFLOW 200 USD challenge",
 )
 
-# Independent 10-day leverage paper challenge. $20 margin per trade,
-# 10-20x leverage, <=0.25% account risk, five concurrent positions.
-leverage_paper_book = PaperBook(
+# Isolated paper-only full-balance challenge; preserve existing ledger.
+class FullBalancePaperBook(PaperBook):
+    def open_confirmed(self, signal, executable):
+        from math import isfinite
+        side = signal["side"]
+        balance = float(self.state["balance"])
+        symbol = signal["symbol"]
+        if not self.active() or self.state["open_trades"] or balance <= 0:
+            log.info("PAPER FULL SIGNAL SKIP | %s %s | active=%s | occupied=%s | balance=%.2f",
+                     side, symbol, self.active(), bool(self.state["open_trades"]), balance)
+            return False
+        raw = float(executable)
+        if side not in ("LONG", "SHORT") or not isfinite(raw) or raw <= 0:
+            log.warning("PAPER FULL SIGNAL SKIP | %s %s | invalid quote", side, symbol)
+            return False
+        direction = 1 if side == "LONG" else -1
+        slip = 0.0001
+        entry = raw * (1 + direction * slip)
+        stop = entry * (1 - direction * 0.001)
+        target = entry * (1 + direction * 0.0025)
+        prepared = dict(signal, entry=raw, stop=stop, targets=[target],
+                        paper_qty=balance * 10 / entry, paper_management_version=4,
+                        paper_max_gross_leverage=10.0, paper_slippage_rate=slip,
+                        entry_time=int(time.time() * 1000))
+        opened = super().open_trade(prepared)
+        if opened:
+            log.info("PAPER FULL SIGNAL OPEN | %s %s | margin=%.2f | leverage=10x | gross_SL=1%% | TP_price=0.25%% | status=%s",
+                     side, symbol, balance, self.status())
+        return opened
+
+    def on_tick(self, symbol, price, event_ms):
+        trade = self.state["open_trades"].get(symbol)
+        if not trade or trade.get("management_version") != 4:
+            return
+        if event_ms < trade["entry_time"]:
+            return
+        direction = 1 if trade["side"] == "LONG" else -1
+        trade["last_mark"] = price
+        reason = None
+        if event_ms // 1000 >= self.state["ends_at"]:
+            reason = "CHALLENGE_END"
+        elif direction * (price - trade["active_stop"]) <= 0:
+            reason = "STOP"
+        elif direction * (price - trade["targets"][0]) >= 0:
+            reason = "TP_FULL"
+        if reason:
+            trade["last_bar_at"] = event_ms // 1000
+            self._exit_qty(trade, price, trade["remaining"], reason)
+            self._close_trade(symbol, reason)
+            log.info("PAPER FULL SIGNAL CLOSED | %s | reason=%s | status=%s", symbol, reason, self.status())
+
+    def on_candle(self, symbol, candle):
+        trade = self.state["open_trades"].get(symbol)
+        if not trade or trade.get("management_version") != 4:
+            return super().on_candle(symbol, candle)
+        if candle["open_time"] <= trade["last_candle_open"]:
+            return
+        trade["last_candle_open"] = candle["open_time"]
+        # Never use pre-entry extremes. Fully post-entry candles are a
+        # conservative fallback for gaps in the live stream (stop first).
+        price = float(candle["close"])
+        if candle["open_time"] >= trade["entry_time"]:
+            long = trade["side"] == "LONG"
+            stop, target = trade["active_stop"], trade["targets"][0]
+            if (float(candle["low"]) <= stop if long else float(candle["high"]) >= stop):
+                price = min(stop, float(candle["open"])) if long else max(stop, float(candle["open"]))
+            elif (float(candle["high"]) >= target if long else float(candle["low"]) <= target):
+                price = target
+        self.on_tick(symbol, price, int(candle["close_time"]))
+        if symbol in self.state["open_trades"]:
+            self._save_data()
+
+
+leverage_paper_book = FullBalancePaperBook(
     path="/data/paper_leverage_200_20261125.json",
     start_balance=200.0,
-    risk_fraction=0.0025,
-    max_open=5,
-    max_gross_leverage=20.0,
+    risk_fraction=0.01,
+    max_open=1,
+    max_gross_leverage=10.0,
     fee_rate=0.0005,
-    label="LEVERAGE 200 USD / 20 USD margin challenge",
-    breakeven_trigger_r=0.50,
-    impulse_exit_r=100.0,
-    impulse_body_ratio=0.99,
-    impulse_close_position=0.01,
+    label="LEVERAGE 200 USD / full balance 10x paper challenge",
 )
 
 load_dotenv()
@@ -523,7 +590,7 @@ async def binance_signal_monitor(session, symbols):
     scan_signals = 0
     last_scan_report = time.monotonic()
 
-    async def dispatch_signal(signal):
+    async def dispatch_signal(signal, executable):
         symbol = signal["symbol"]
         if SIGNAL_DELIVERY_SYMBOLS and symbol not in SIGNAL_DELIVERY_SYMBOLS:
             return
@@ -534,21 +601,8 @@ async def binance_signal_monitor(session, symbols):
             opened = paper_book.open_trade(signal)
             if opened:
                 log.info("PAPER STATUS | %s", paper_book.status())
-        if leverage_paper_book.active():
-            repeated_loss = recent_paper_loss(signal, leverage_paper_book.state["closed_trades"], time.time())
-            leverage_signal = None if repeated_loss else build_structural_paper_signal(signal, leverage_paper_book.state["balance"])
-            if repeated_loss:
-                log.info("PAPER LEVERAGE REENTRY BLOCKED | %s %s | recent same-side loss within 60m", signal["side"], symbol)
-            if leverage_signal:
-                leverage_opened = leverage_paper_book.open_trade(leverage_signal)
-                if leverage_opened:
-                    log.info(
-                        "PAPER LEVERAGE CHALLENGE OPENED | %s %s | policy=structural-risk-v2 | margin_cap=$20 | planned_margin=$%.4f | nominal_leverage=%sx | planned_loss=$%.4f | TP=1.00/1.25/1.50%% | status=%s",
-                        leverage_signal["side"], symbol, leverage_signal["paper_margin"], leverage_signal["paper_leverage"], leverage_signal["paper_planned_loss"],
-                        leverage_paper_book.status()
-                    )
-            else:
-                log.info("PAPER LEVERAGE QUALITY SKIP | %s %s | structural risk or net reward not eligible", signal["side"], symbol)
+        # The confirmed Telegram signal is the sole entry trigger for this book.
+        leverage_paper_book.open_confirmed(signal, executable)
         # Separate experiment: base signal must be confirmed by a fresh persistent
         # order-book wall plus opposing aggressive taker flow (absorption).
         if symbol in PAPER_TEST_SYMBOLS and orderflow_paper_book.active() and orderflow_paper_book.state["balance"] > orderflow_paper_book.state["starting_balance"] * 0.95:
@@ -702,7 +756,7 @@ async def binance_signal_monitor(session, symbols):
                          status if checked_id == candle["open_time"] else "no_preview_tick")
                 log.info("SIGNAL QUALITY PASS | %s %s | score=%s | buy_share=%s | btc_change=%s | relative=%s",
                          signal["side"], symbol, score, context["buy_share"], context["btc_change"], context["relative"])
-                await dispatch_signal(signal)
+                await dispatch_signal(signal, executable)
 
         if now_mono - last_scan_report >= 60:
             top_rejections = scan_rejections.most_common(6)
@@ -783,6 +837,8 @@ async def binance_signal_monitor(session, symbols):
                         bar = data["k"]
                         tf, symbol = bar["i"], data["s"]
                         now_ms = int(time.time() * 1000)
+                        if tf == "5m":
+                            leverage_paper_book.on_tick(symbol, float(bar["c"]), int(data.get("E", now_ms)))
                         if not bar["x"] and (tf != "5m" or not 5000 <= bar["T"] + 1 - now_ms <= 30500):
                             continue
                         candle = {"open_time": bar["t"], "close_time": bar["T"],
@@ -935,7 +991,7 @@ async def main():
              paper_sprint_v3_book.status(), paper_sprint_v3_book.state["ends_at"])
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
-    log.info("PAPER LEVERAGE CHALLENGE | %s | policy=structural-risk-v2 | margin_cap=$20 | nominal_leverage=10x | risk=0.25%% | max_open=5 | TP=1.00/1.25/1.50%%",
+    log.info("PAPER LEVERAGE CHALLENGE | %s | policy=full-balance-v4 | margin=100%% | leverage=10x | gross_SL=1%% | max_open=1 | TP_price=0.25%% | live_ticks=enabled",
              leverage_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
