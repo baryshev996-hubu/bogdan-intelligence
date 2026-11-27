@@ -223,7 +223,7 @@ def is_allowed_telegram_alert(message: str) -> bool:
     if not lines:
         return False
 
-    if re.fullmatch(r"🟡 Возможен (?:LONG|SHORT) по [A-Z0-9]{1,30}USDT, до закрытия 30 секунд", message):
+    if re.fullmatch(r"🟡 Возможен (?:LONG|SHORT) по [A-Z0-9]{1,30}USDT, до закрытия (?:30 секунд|≈(?:[5-9]|[12][0-9]|3[01]) с)", message):
         return True
 
     header = lines[0].upper()
@@ -697,6 +697,9 @@ async def binance_signal_monitor(session, symbols):
                     "Оценка качества условий, не вероятность прибыли",
                 ])
                 scan_signals += 1
+                checked_id, status = preview_status.get(symbol, (None, None))
+                log.info("SIGNAL PREVIEW RESULT | %s | %s", symbol,
+                         status if checked_id == candle["open_time"] else "no_preview_tick")
                 log.info("SIGNAL QUALITY PASS | %s %s | score=%s | buy_share=%s | btc_change=%s | relative=%s",
                          signal["side"], symbol, score, context["buy_share"], context["btc_change"], context["relative"])
                 await dispatch_signal(signal)
@@ -714,7 +717,8 @@ async def binance_signal_monitor(session, symbols):
             last_scan_report = now_mono
 
     closed_stream = {}
-    preview_checked = {}
+    preview_status = {}
+    preview_next_check = {}
     preview_tasks = set()
     close_event = asyncio.Event()
     last_wakeup = 0
@@ -723,32 +727,42 @@ async def binance_signal_monitor(session, symbols):
         if (not ENABLE_SIGNAL_DELIVERY or symbol not in signal_symbols
                 or (SIGNAL_DELIVERY_SYMBOLS and symbol not in SIGNAL_DELIVERY_SYMBOLS)):
             return
-        if not 28000 <= candle["close_time"] + 1 - now_ms <= 30500:
+        remaining_ms = candle["close_time"] + 1 - now_ms
+        if not 5000 <= remaining_ms <= 30500 or now_ms < preview_next_check.get(symbol, 0):
             return
-        if preview_checked.get(symbol) == candle["open_time"]:
-            return
-        preview_checked[symbol] = candle["open_time"]
+        preview_next_check[symbol] = now_ms + 4000
+        candle_id = candle["open_time"]
+        preview_status[symbol] = (candle_id, "history_gap")
         snapshot = dict(histories[symbol])
         if not snapshot["5m"] or snapshot["5m"][-1]["open_time"] + 300000 != candle["open_time"]:
             return
         # Use only information available now. Never insert the open bar in live histories.
         partial = dict(candle, close_time=now_ms)
         snapshot["5m"] = [*snapshot["5m"], partial][-MAX_CANDLES:]
-        candidate = evaluate(symbol, snapshot, as_of_ms=now_ms)
+        diagnostics = {}
+        candidate = evaluate(symbol, snapshot, as_of_ms=now_ms, diagnostics=diagnostics)
         if not candidate:
+            preview_status[symbol] = (candle_id, next(iter(diagnostics), "no_candidate"))
             return
         context = market_context(partial, snapshot["1h"], histories.get("BTCUSDT", {}).get("1h", ()))
         _, reason = assess_quality(candidate, context, snapshot)
         if reason is not None:
+            preview_status[symbol] = (candle_id, reason)
             return
-        message = f"🟡 Возможен {candidate['side']} по {symbol}, до закрытия 30 секунд"
+        preview_next_check[symbol] = candle["close_time"] + 1
+        preview_status[symbol] = (candle_id, "queued")
+        seconds = (remaining_ms + 500) // 1000
+        message = f"🟡 Возможен {candidate['side']} по {symbol}, до закрытия ≈{seconds} с"
 
         async def send_preview():
             try:
-                await asyncio.wait_for(telegram_send(session, message), timeout=5)
+                delivered = await asyncio.wait_for(telegram_send(session, message), timeout=min(10, remaining_ms / 1000))
+                preview_status[symbol] = (candle_id, "sent" if delivered else "delivery_failed")
             except asyncio.TimeoutError:
+                preview_status[symbol] = (candle_id, "delivery_timeout")
                 log.info("SIGNAL PREVIEW TIMEOUT | %s", symbol)
             except Exception:
+                preview_status[symbol] = (candle_id, "delivery_exception")
                 log.exception("SIGNAL PREVIEW FAILED | %s", symbol)
 
         task = asyncio.create_task(send_preview())
@@ -769,7 +783,7 @@ async def binance_signal_monitor(session, symbols):
                         bar = data["k"]
                         tf, symbol = bar["i"], data["s"]
                         now_ms = int(time.time() * 1000)
-                        if not bar["x"] and (tf != "5m" or not 28000 <= bar["T"] + 1 - now_ms <= 30500):
+                        if not bar["x"] and (tf != "5m" or not 5000 <= bar["T"] + 1 - now_ms <= 30500):
                             continue
                         candle = {"open_time": bar["t"], "close_time": bar["T"],
                                   "open": float(bar["o"]), "high": float(bar["h"]),
