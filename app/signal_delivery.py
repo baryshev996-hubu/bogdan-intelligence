@@ -12,6 +12,9 @@ log = logging.getLogger("bogdan-intel.delivery")
 PATH = os.getenv("SIGNAL_QUEUE_PATH", "/data/signal_delivery.sqlite")
 
 
+_delivery_ready = asyncio.Event()
+
+
 def connect():
     db = sqlite3.connect(PATH)
     db.execute("""CREATE TABLE IF NOT EXISTS deliveries (
@@ -28,11 +31,13 @@ def queue_signal(signal, recipients):
         db.execute("DELETE FROM deliveries WHERE candle < ?", (candle - 86400000,))
         db.executemany("INSERT OR IGNORE INTO deliveries(symbol,candle,recipient,message) VALUES(?,?,?,?)",
                        [(signal["symbol"], candle, recipient, message) for recipient in recipients])
+    _delivery_ready.set()
 
 
 async def deliver_signals(session, sender):
     with closing(connect()) as db:
         while True:
+            _delivery_ready.clear()
             now = int(time.time())
             with db:
                 # Expire after 90s from the 5m close and never deliver pre-v2 queued alerts.
@@ -47,7 +52,10 @@ async def deliver_signals(session, sender):
                                 WHERE done=0 AND next_try<=? ORDER BY next_try,rowid LIMIT 1""",
                              (now,)).fetchone()
             if not row:
-                await asyncio.sleep(0.5)
+                try:
+                    await asyncio.wait_for(_delivery_ready.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
                 continue
             key, symbol, recipient, message = row
             ok = await sender(session, message, recipient_only=recipient)
