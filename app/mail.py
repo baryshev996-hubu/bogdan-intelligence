@@ -77,7 +77,7 @@ orderflow_paper_book = PaperBook(
     label="ORDERFLOW 200 USD challenge",
 )
 
-# Isolated paper-only full-balance challenge; preserve existing ledger.
+# Isolated paper-only full-balance challenge; previous ledger remains archived.
 class FullBalancePaperBook(PaperBook):
     def open_confirmed(self, signal, executable):
         from math import isfinite
@@ -95,7 +95,14 @@ class FullBalancePaperBook(PaperBook):
         direction = 1 if side == "LONG" else -1
         slip = 0.0001
         entry = raw * (1 + direction * slip)
-        stop = entry * (1 - direction * 0.001)
+        # Target a net 10% loss of margin at the stop, including modeled fees
+        # and exit slippage. Gaps can still produce a larger realized loss.
+        loss_per_notional = self.risk_fraction / 10.0
+        fee = self.fee_rate
+        fill_ratio = ((1 + fee - loss_per_notional) / (1 - fee)
+                      if direction == 1 else
+                      (1 - fee + loss_per_notional) / (1 + fee))
+        stop = entry * fill_ratio / (1 - direction * slip)
         target = entry * (1 + direction * 0.0025)
         prepared = dict(signal, entry=raw, stop=stop, targets=[target],
                         paper_qty=balance * 10 / entry, paper_management_version=4,
@@ -103,7 +110,7 @@ class FullBalancePaperBook(PaperBook):
                         entry_time=int(time.time() * 1000))
         opened = super().open_trade(prepared)
         if opened:
-            log.info("PAPER FULL SIGNAL OPEN | %s %s | margin=%.2f | leverage=10x | gross_SL=1%% | TP_price=0.25%% | status=%s",
+            log.info("PAPER FULL SIGNAL OPEN | %s %s | margin=%.2f | leverage=10x | target_net_SL=10%% | TP_price=0.25%% | status=%s",
                      side, symbol, balance, self.status())
         return opened
 
@@ -151,9 +158,9 @@ class FullBalancePaperBook(PaperBook):
 
 
 leverage_paper_book = FullBalancePaperBook(
-    path="/data/paper_leverage_200_20261125.json",
+    path="/data/paper_leverage_200_20261128_sl10.json",
     start_balance=200.0,
-    risk_fraction=0.01,
+    risk_fraction=0.10,
     max_open=1,
     max_gross_leverage=10.0,
     fee_rate=0.0005,
@@ -892,7 +899,7 @@ async def main():
              paper_sprint_v3_book.status(), paper_sprint_v3_book.state["ends_at"])
 
     log.info("ORDERFLOW PAPER CHALLENGE | %s", orderflow_paper_book.status())
-    log.info("PAPER LEVERAGE CHALLENGE | %s | policy=full-balance-v4 | margin=100%% | leverage=10x | gross_SL=1%% | max_open=1 | TP_price=0.25%% | live_ticks=enabled",
+    log.info("PAPER LEVERAGE CHALLENGE | %s | policy=full-balance-v5-net-sl10 | margin=100%% | leverage=10x | target_net_SL=10%% | max_open=1 | TP_price=0.25%% | live_ticks=enabled",
              leverage_paper_book.status())
 
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
